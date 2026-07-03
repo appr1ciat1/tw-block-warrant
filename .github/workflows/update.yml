@@ -1,0 +1,82 @@
+name: Daily Update
+
+# 鉅額交易方向判定 × 權證同向訊號：每日自動更新 + 歷史累積
+on:
+  schedule:
+    # 每週一到六 UTC 11:00 = 台灣 19:00（BFIAUU/MI_INDEX/T86 皆已於 ~17:30 前發布）。
+    # 含週六以涵蓋補班交易日；實際是否交易日由 XTAI 行事曆判定。
+    # 注意：GitHub cron 可能延遲數分鐘，實際落地約 19:00–19:15。
+    - cron: '0 11 * * 1-6'
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: '回補日曆日數（首次建歷史用）'
+        required: false
+        default: '0'
+
+concurrency:
+  group: daily-update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check Taiwan trading day
+        id: twcheck
+        run: |
+          python - <<'PY'
+          import os, datetime
+          is_trading = True
+          if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+              try:
+                  import exchange_calendars as xcals, pandas as pd
+                  tw = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date()
+                  is_trading = bool(xcals.get_calendar("XTAI").is_session(pd.Timestamp(tw)))
+                  print("台灣日期", tw, "交易日?", is_trading)
+              except Exception as e:
+                  print("行事曆判定失敗，預設執行:", e); is_trading = True
+          else:
+              print("手動觸發 → 一律執行")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"is_trading={'true' if is_trading else 'false'}\n")
+          PY
+
+      - name: Update data + signals + report
+        if: steps.twcheck.outputs.is_trading == 'true'
+        run: |
+          python update.py --backfill "${{ github.event.inputs.backfill || '0' }}"
+
+      - name: Commit and push
+        if: steps.twcheck.outputs.is_trading == 'true'
+        run: |
+          git config --global user.email "voidful.stack@gmail.com"
+          git config --global user.name "Voidful"
+
+          git add data report.html index.html signals.json || true
+
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "🧲 daily update ($(date -u -d '+8 hours' '+%Y-%m-%d') TW)"
+          fi
+
+          git fetch --no-tags --depth=50 origin main:refs/remotes/origin/main
+          git rebase --autostash origin/main
+          git push origin HEAD:main
