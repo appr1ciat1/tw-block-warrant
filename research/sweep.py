@@ -16,8 +16,10 @@ import sys
 
 import pandas as pd
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
+_HERE = os.path.dirname(os.path.abspath(__file__))   # research/
+_ROOT = os.path.dirname(_HERE)                        # repo 根（原始每日訊號版）
+sys.path.insert(0, _ROOT)   # 原始資料/訊號模組（唯讀）
+sys.path.insert(0, _HERE)   # 同層的 backtest
 
 from block_trades import load_block_history
 from warrant_flows import load_warrant_history

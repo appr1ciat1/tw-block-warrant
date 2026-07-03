@@ -26,8 +26,9 @@ import sys
 import numpy as np
 import pandas as pd
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
+_HERE = os.path.dirname(os.path.abspath(__file__))   # research/
+_ROOT = os.path.dirname(_HERE)                        # repo 根（原始每日訊號版）
+sys.path.insert(0, _ROOT)   # 從根目錄 import 原始資料/訊號模組（唯讀，不改動原始版）
 
 from block_trades import load_block_history
 from warrant_flows import load_warrant_history
@@ -35,7 +36,7 @@ from market_refs import load_close_history, load_inst_history
 from update import (classify_block_direction, build_evidence, classify,
                     window_cutoff, STOCK_CODE)
 
-REPORT = os.path.join(_HERE, "backtest.html")
+REPORT = os.path.join(_HERE, "backtest.html")   # 延伸版輸出留在 research/
 MKT = "0050"
 TRADING_DAYS = 252
 

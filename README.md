@@ -5,6 +5,18 @@
 
 📊 **每日報表**：<https://appr1ciat1.github.io/tw-block-warrant/>（= `report.html`）
 
+## 兩層架構（獨立分開，互不取代）
+
+專案分為兩個**獨立版本**，延伸層只唯讀原始層的資料、絕不改動或取代原始版：
+
+| 層 | 位置 | 內容 | 執行 |
+|---|---|---|---|
+| **① 原始每日訊號版** | repo 根目錄 | 抓資料、判方向、五窗輪動訊號 → `report.html`/`index.html`/`signals.json`。這是每天 19:00 自動跑、Pages 首頁呈現的**生產系統**，邏輯保持穩定。 | `update.py`（workflow 自動） |
+| **② 延伸研究/優化版** | `research/` | 回測引擎、設定掃描、風報比優化等**研究層**，唯讀根目錄資料做分析，輸出 `research/backtest.html`。不進每日 workflow、不動原始版訊號。 | 手動 `python research/*.py` |
+
+原始版的每日訊號定義（判定矩陣）保持不變；優化得到的參數（如共振≥3、持有20日）
+屬**延伸版的策略配置**，是原始版之上另建的一層，不回寫覆蓋原始版。
+
 ## 核心假說
 
 一檔股票的認購權證被**連續買進且量大**，是槓桿多頭資金流入的訊號。
@@ -114,8 +126,8 @@ python update.py --windows 5,10,20 --primary-window 5   # 自訂偵查窗
 python update.py --deepen-to 2025-07-01   # 歷史往過去加深一年
 python update.py --prem-th 0.01 --inst-ratio 0.3   # 調方向門檻
 python validate.py                # 事後驗證：各方向組的後續超額報酬
-python backtest.py --min-reso 3 --hold 20   # 事件驅動回測（權益曲線+Sharpe/MDD/Calmar）
-python sweep.py                   # 一次回放掃多組設定，比較風報比堆疊
+python research/backtest.py --min-reso 3 --hold 20   # 事件驅動回測（權益曲線+Sharpe/MDD/Calmar）
+python research/sweep.py          # 一次回放掃多組設定，比較風報比堆疊
 ```
 
 輸出：`report.html` / `index.html`（同向買入 / 避險剔除 / 全部判定 / 逐筆明細含方向證據）
