@@ -19,6 +19,7 @@ API ：https://www.twse.com.tw/rwd/zh/block/BFIAUU?date=YYYYMMDD&selectType=S&re
 """
 
 import os
+import re
 import ssl
 import json
 import time
@@ -27,16 +28,29 @@ from datetime import date, timedelta
 
 import pandas as pd
 
+_CODE_RE = re.compile(r"^[0-9A-Z]{4,6}$")   # 證券代號（含 2887H/01010T 等）；排除「總計」列
+
+
+def _check_stat(d):
+    """TWSE 限流時會回假錯誤（如「查詢日期小於93年2月11日」）而非 429——
+    若當成非交易日靜默跳過會留洞。真的查無資料才回空，其餘一律 raise。"""
+    msg = str(d.get("stat"))
+    if "沒有符合條件" in msg or "查無" in msg:
+        return
+    raise RuntimeError(f"TWSE 異常回應（疑似限流）: {msg}")
+
 _CTX = ssl.create_default_context()
 _CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT  # OpenSSL3 嚴格檢查會擋 TWSE 憑證(缺 SKI 擴展)
 
 API_URL = "https://www.twse.com.tw/rwd/zh/block/BFIAUU?date={date}&selectType=S&response=json"
 _HERE = os.path.dirname(os.path.abspath(__file__))
-HISTORY_CSV = os.path.join(_HERE, "data", "block_trades.csv")
+HISTORY_BASE = os.path.join(_HERE, "data", "block_trades")   # 年度分檔目錄（storage.py）
 _REQUEST_PAUSE = 3.0   # TWSE 對高頻抓取會封鎖，務必保守
 TIMEOUT = 30
 
 COLUMNS = ["date", "code", "name", "trade_type", "price", "shares", "value"]
+
+from storage import load_history as _load_hist, save_history as _save_hist  # noqa: E402
 
 
 def _fetch_json(url):
@@ -72,7 +86,10 @@ def fetch_block_trades(date_str, verbose=False):
         if verbose:
             print(f"   ⚠️ 鉅額交易抓取失敗 {ymd}: {e}")
         raise
-    if d.get("stat") != "OK" or not d.get("data"):
+    if d.get("stat") != "OK":
+        _check_stat(d)   # 限流假錯誤 → raise；真無資料 → 空表
+        return pd.DataFrame(columns=COLUMNS)
+    if not d.get("data"):
         return pd.DataFrame(columns=COLUMNS)
 
     iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
@@ -87,21 +104,19 @@ def fetch_block_trades(date_str, verbose=False):
             "value": _num(r[5]),
         }
         for r in d["data"]
+        # JSON 最後一列是「總計」彙總列（非交易），吃進去金額會整整多一倍
+        if _CODE_RE.match(r[0].strip())
     ]
     return pd.DataFrame(rows, columns=COLUMNS)
 
 
-def load_block_history(path=HISTORY_CSV):
-    """讀取累積歷史；不存在回空 DataFrame。"""
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=COLUMNS)
-    df = pd.read_csv(path, dtype={"code": str})
-    df["date"] = df["date"].astype(str)
-    return df
+def load_block_history(base=HISTORY_BASE, years=None):
+    """讀取累積歷史（年度分檔＋舊制單檔自動相容）；不存在回空 DataFrame。"""
+    return _load_hist(base, COLUMNS, years=years)
 
 
-def update_block_history(path=HISTORY_CSV, backfill_days=0, end_date=None,
-                         deepen_to=None, verbose=True):
+def update_block_history(base=HISTORY_BASE, backfill_days=0, end_date=None,
+                         deepen_to=None, keep_years=None, verbose=True):
     """
     增量更新鉅額交易歷史。
 
@@ -115,7 +130,7 @@ def update_block_history(path=HISTORY_CSV, backfill_days=0, end_date=None,
     pd.DataFrame 更新後完整歷史。
     """
     end = pd.Timestamp(end_date) if end_date else pd.Timestamp(date.today())
-    hist = load_block_history(path)
+    hist = load_block_history(base)
 
     if len(hist):
         start = pd.Timestamp(hist["date"].max()) + timedelta(days=1)
@@ -168,11 +183,8 @@ def update_block_history(path=HISTORY_CSV, backfill_days=0, end_date=None,
     if len(hist):
         hist = hist[~hist["date"].isin(new_dates)]  # 同日覆蓋
     merged = pd.concat([hist, new_df], ignore_index=True)
-    merged = merged.sort_values(["date", "code"]).reset_index(drop=True)
-
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    merged.to_csv(path, index=False)
+    merged = _save_hist(base, merged, keep_years=keep_years, sort_cols=("date", "code"))
     if verbose:
         print(f"   ✅ [鉅額] 新增 {len(new_df)} 筆（{len(new_dates)} 日），"
-              f"累積 {len(merged)} 筆 → {path}")
+              f"累積 {len(merged)} 筆 → {base}/")
     return merged

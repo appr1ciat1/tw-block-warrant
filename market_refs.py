@@ -34,8 +34,8 @@ _CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT  # OpenSSL3 嚴格檢查會擋 TWSE
 CLOSE_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date}&type=ALLBUT0999&response=json"
 T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86?date={date}&selectType=ALLBUT0999&response=json"
 _HERE = os.path.dirname(os.path.abspath(__file__))
-CLOSES_CSV = os.path.join(_HERE, "data", "stock_closes.csv")
-INST_CSV = os.path.join(_HERE, "data", "inst_flows.csv")
+CLOSES_BASE = os.path.join(_HERE, "data", "stock_closes")   # 年度分檔目錄（storage.py）
+INST_BASE = os.path.join(_HERE, "data", "inst_flows")
 _REQUEST_PAUSE = 3.0   # TWSE 對高頻抓取會封鎖，務必保守
 TIMEOUT = 60
 
@@ -56,11 +56,21 @@ def _num(s):
         return float("nan")
 
 
+def _check_stat(d):
+    """TWSE 限流時會回假錯誤而非 429——當成非交易日跳過會留洞。
+    真的查無資料才回空，其餘一律 raise（由呼叫端記錄、heal 補洞）。"""
+    msg = str(d.get("stat"))
+    if "沒有符合條件" in msg or "查無" in msg:
+        return
+    raise RuntimeError(f"TWSE 異常回應（疑似限流）: {msg}")
+
+
 def fetch_stock_closes(date_str):
     """單日全市場個股收盤價（不含權證/牛熊證）；非交易日回空 DataFrame。"""
     ymd = str(date_str).replace("-", "")
     d = _fetch_json(CLOSE_URL.format(date=ymd))
     if d.get("stat") != "OK":
+        _check_stat(d)
         return pd.DataFrame(columns=CLOSE_COLUMNS)
     fields, data = None, None
     for t in d.get("tables") or []:
@@ -83,7 +93,10 @@ def fetch_inst_flows(date_str):
     """單日全市場三大法人買賣超（股數）；非交易日回空 DataFrame。"""
     ymd = str(date_str).replace("-", "")
     d = _fetch_json(T86_URL.format(date=ymd))
-    if d.get("stat") != "OK" or not d.get("data"):
+    if d.get("stat") != "OK":
+        _check_stat(d)
+        return pd.DataFrame(columns=INST_COLUMNS)
+    if not d.get("data"):
         return pd.DataFrame(columns=INST_COLUMNS)
     f = d["fields"]
 
@@ -124,24 +137,20 @@ def fetch_inst_flows(date_str):
     return pd.DataFrame(rows, columns=INST_COLUMNS)
 
 
-def _load(path, columns):
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=columns)
-    df = pd.read_csv(path, dtype={"code": str})
-    df["date"] = df["date"].astype(str)
-    return df
+from storage import load_history as _load_hist, save_history as _save_hist  # noqa: E402
 
 
-def load_close_history(path=CLOSES_CSV):
-    return _load(path, CLOSE_COLUMNS)
+def load_close_history(base=CLOSES_BASE, years=None):
+    return _load_hist(base, CLOSE_COLUMNS, years=years)
 
 
-def load_inst_history(path=INST_CSV):
-    return _load(path, INST_COLUMNS)
+def load_inst_history(base=INST_BASE, years=None):
+    return _load_hist(base, INST_COLUMNS, years=years)
 
 
-def _update_history(path, columns, fetch_fn, label,
-                    first_start=None, end_date=None, deepen_to=None, verbose=True):
+def _update_history(base, columns, fetch_fn, label,
+                    first_start=None, end_date=None, deepen_to=None,
+                    keep_years=None, verbose=True):
     """
     通用增量更新（邏輯同 block_trades.update_block_history）：
     - 首次執行（無歷史檔）：從 first_start 開始回補（預設今天）。
@@ -150,7 +159,7 @@ def _update_history(path, columns, fetch_fn, label,
     - 同一日重跑整日覆蓋，避免重複列。
     """
     end = pd.Timestamp(end_date) if end_date else pd.Timestamp(date.today())
-    hist = _load(path, columns)
+    hist = _load_hist(base, columns)
 
     if len(hist):
         start = pd.Timestamp(hist["date"].max()) + timedelta(days=1)
@@ -201,26 +210,23 @@ def _update_history(path, columns, fetch_fn, label,
     if len(hist):
         hist = hist[~hist["date"].isin(new_dates)]
     merged = pd.concat([hist, new_df], ignore_index=True)
-    merged = merged.sort_values(["date", "code"]).reset_index(drop=True)
-
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    merged.to_csv(path, index=False)
+    merged = _save_hist(base, merged, keep_years=keep_years, sort_cols=("date", "code"))
     if verbose:
-        print(f"   ✅ [{label}] 新增 {len(new_dates)} 日，累積 {len(merged)} 筆 → {path}")
+        print(f"   ✅ [{label}] 新增 {len(new_dates)} 日，累積 {len(merged)} 筆 → {base}/")
     return merged
 
 
-def update_close_history(path=CLOSES_CSV, first_start=None, end_date=None,
-                         deepen_to=None, verbose=True):
+def update_close_history(base=CLOSES_BASE, first_start=None, end_date=None,
+                         deepen_to=None, keep_years=None, verbose=True):
     """增量更新全市場收盤價。首次執行從 first_start（通常=鉅額歷史最早日）回補。"""
-    return _update_history(path, CLOSE_COLUMNS, fetch_stock_closes, "收盤價",
+    return _update_history(base, CLOSE_COLUMNS, fetch_stock_closes, "收盤價",
                            first_start=first_start, end_date=end_date,
-                           deepen_to=deepen_to, verbose=verbose)
+                           deepen_to=deepen_to, keep_years=keep_years, verbose=verbose)
 
 
-def update_inst_history(path=INST_CSV, first_start=None, end_date=None,
-                        deepen_to=None, verbose=True):
+def update_inst_history(base=INST_BASE, first_start=None, end_date=None,
+                        deepen_to=None, keep_years=None, verbose=True):
     """增量更新三大法人買賣超。首次執行從 first_start（通常=鉅額歷史最早日）回補。"""
-    return _update_history(path, INST_COLUMNS, fetch_inst_flows, "法人",
+    return _update_history(base, INST_COLUMNS, fetch_inst_flows, "法人",
                            first_start=first_start, end_date=end_date,
-                           deepen_to=deepen_to, verbose=verbose)
+                           deepen_to=deepen_to, keep_years=keep_years, verbose=verbose)

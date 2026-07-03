@@ -51,22 +51,28 @@ import json
 import os
 import re
 import sys
+import time
 
 import pandas as pd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)   # 讓 update.py 從任何 CWD 都能 import 同資料夾模組
 
+import block_trades as _bt                                                # noqa: E402
+import warrant_flows as _wf                                               # noqa: E402
+import market_refs as _mr                                                 # noqa: E402
 from block_trades import update_block_history, load_block_history        # noqa: E402
 from warrant_flows import update_warrant_history, load_warrant_history   # noqa: E402
 from market_refs import (update_close_history, load_close_history,       # noqa: E402
                          update_inst_history, load_inst_history)
+from storage import load_history as _load_hist, save_history as _save_hist  # noqa: E402
 
 HTML_FILE = os.path.join(_HERE, "report.html")
 INDEX_FILE = os.path.join(_HERE, "index.html")   # GitHub Pages 首頁 = 報表
 SIGNALS_JSON = os.path.join(_HERE, "signals.json")
-SIGNAL_HISTORY_CSV = os.path.join(_HERE, "data", "signal_history.csv")
+SIGNAL_HISTORY_BASE = os.path.join(_HERE, "data", "signal_history")   # 年度分檔
 STOCK_CODE = re.compile(r"^\d{4,6}$")   # 個股/ETF；排除 IX0001 等指數標的
+SLICE_DAYS = 200   # 訊號計算只需近期資料；深歷史留給 validate.py
 
 
 # ── 鉅額方向：獨立證據（溢折價 + 法人）───────────────────────────
@@ -267,7 +273,7 @@ def classify(ev, args):
     return ev
 
 
-def append_signal_history(ev, latest, path=SIGNAL_HISTORY_CSV):
+def append_signal_history(ev, latest, base=SIGNAL_HISTORY_BASE):
     """把當日全部（窗×標的）判定 append 到歷史（同日重跑覆蓋），供日後統計各級後續報酬。"""
     cols = ["date", "window", "code", "name", "verdict", "score",
             "blk_dir", "blk_wdir", "blk_prem", "blk_inst_ratio",
@@ -278,15 +284,57 @@ def append_signal_history(ev, latest, path=SIGNAL_HISTORY_CSV):
     today.insert(0, "date", latest)
     today = today[cols]
 
-    if os.path.exists(path):
-        hist = pd.read_csv(path, dtype={"code": str})
-        hist = hist[hist["date"] != latest]
-        merged = pd.concat([hist, today], ignore_index=True)
-    else:
-        merged = today
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    merged.to_csv(path, index=False)
+    hist = _load_hist(base, cols, years=1)   # 去重只需當年檔（舊制單檔自動併入遷移）
+    hist = hist[hist["date"] != latest]
+    merged = pd.concat([hist, today], ignore_index=True)
+    _save_hist(base, merged, sort_cols=("date", "window", "code"))
     return len(today)
+
+
+# ── 補洞：TWSE 限流時 stat!=OK 會被當「非交易日」靜默跳過而留洞 ──
+def heal_recent(block, warr, closes, inst, days=45, keep_years=None, verbose=True):
+    """
+    以四資料源近 days 天的日期「聯集」為交易日參考，補抓各源缺少的日期。
+    （例：2026-06-04 T86 曾因短列失敗、MI_INDEX 限流時回假錯誤 → 都會留洞，
+    每日執行時自動回填；抓不到就留待下次。）
+    """
+    if not days:
+        return block, warr, closes, inst
+    all_dates = set()
+    for df in (block, warr, closes, inst):
+        if len(df):
+            all_dates.update(df["date"])
+    if not all_dates:
+        return block, warr, closes, inst
+    cutoff = (pd.Timestamp(max(all_dates)) - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+    ref = {d for d in all_dates if d >= cutoff}
+
+    def _heal(name, df, fetch_fn, base, sort_cols):
+        own = set(df["date"])
+        missing = sorted(d for d in ref if d not in own)
+        if not missing:
+            return df
+        if verbose:
+            print(f"🩹 [{name}] 補洞 {len(missing)} 日：{'、'.join(missing)}")
+        frames = []
+        for d in missing:
+            try:
+                got = fetch_fn(d.replace("-", ""))
+                if len(got):
+                    frames.append(got)
+            except Exception as e:  # noqa: BLE001 — 補不到留待下次
+                print(f"   ⚠️ {d} 補洞失敗: {e}")
+            time.sleep(3.0)
+        if frames:
+            df = pd.concat([df] + frames, ignore_index=True)
+            df = _save_hist(base, df, keep_years=keep_years, sort_cols=sort_cols)
+        return df
+
+    block = _heal("鉅額", block, _bt.fetch_block_trades, _bt.HISTORY_BASE, ("date", "code"))
+    warr = _heal("權證", warr, _wf.fetch_warrant_flows, _wf.HISTORY_BASE, ("date", "underlying"))
+    closes = _heal("收盤價", closes, _mr.fetch_stock_closes, _mr.CLOSES_BASE, ("date", "code"))
+    inst = _heal("法人", inst, _mr.fetch_inst_flows, _mr.INST_BASE, ("date", "code"))
+    return block, warr, closes, inst
 
 
 # ── 報表 ────────────────────────────────────────────────────────
@@ -531,18 +579,29 @@ def main():
                     help="法人買賣超金額/鉅額金額 的方向門檻")
     ap.add_argument("--deepen-to", default=None,
                     help="往過去回補歷史到指定日(YYYY-MM-DD)；API 下限：鉅額 2005-04-04、T86 2012-05-02")
+    ap.add_argument("--keep-years", type=int, default=10,
+                    help="滾動留存年數(0=不刪)；年度分檔，過舊整年檔自動移除")
+    ap.add_argument("--heal-days", type=int, default=45,
+                    help="自動補洞回看天數(0=關)；補限流/短列造成的缺日")
     args = ap.parse_args()
+    keep = args.keep_years or None
 
     if args.no_update:
         block, warr = load_block_history(), load_warrant_history()
         closes, inst = load_close_history(), load_inst_history()
     else:
-        block = update_block_history(backfill_days=args.backfill, deepen_to=args.deepen_to)
-        warr = update_warrant_history(backfill_days=args.backfill, deepen_to=args.deepen_to)
+        block = update_block_history(backfill_days=args.backfill,
+                                     deepen_to=args.deepen_to, keep_years=keep)
+        warr = update_warrant_history(backfill_days=args.backfill,
+                                      deepen_to=args.deepen_to, keep_years=keep)
         # 方向參考資料：首次從鉅額歷史最早日回補，之後增量
         first = block["date"].min() if len(block) else None
-        closes = update_close_history(first_start=first, deepen_to=args.deepen_to)
-        inst = update_inst_history(first_start=first, deepen_to=args.deepen_to)
+        closes = update_close_history(first_start=first,
+                                      deepen_to=args.deepen_to, keep_years=keep)
+        inst = update_inst_history(first_start=first,
+                                   deepen_to=args.deepen_to, keep_years=keep)
+        block, warr, closes, inst = heal_recent(block, warr, closes, inst,
+                                                days=args.heal_days, keep_years=keep)
 
     if not len(warr) or not len(block):
         print("⚠️ 尚無足夠歷史資料，先跑 --backfill 回補")
@@ -553,16 +612,25 @@ def main():
         print("⚠️ 權證歷史為空")
         return
 
+    # ── 近期切片：訊號只需近 SLICE_DAYS 天，避免深歷史拖慢每日計算 ──
+    latest = warr_dates[-1]
+    s_from = (pd.Timestamp(latest) - pd.Timedelta(days=SLICE_DAYS)).strftime("%Y-%m-%d")
+    warr_s = warr[warr["date"] >= s_from]
+    block_s = block[block["date"] >= s_from]
+    closes_s = closes[closes["date"] >= s_from]
+    inst_s = inst[inst["date"] >= s_from]
+    warr_dates = [d for d in warr_dates if d >= s_from]
+
     # ── 時間段輪動：每個偵查窗各判定一次 ──
     windows = [w.strip().upper() if w.strip().upper() == "W3" else w.strip()
                for w in args.windows.split(",") if w.strip()]
-    evs, trades_by_win, latest = {}, {}, warr_dates[-1]
+    evs, trades_by_win = {}, {}
     for w in windows:
         cutoff = window_cutoff(w, warr_dates)
         trades_w, blk_dirs = classify_block_direction(
-            block, closes, inst, cutoff,
+            block_s, closes_s, inst_s, cutoff,
             prem_th=args.prem_th, inst_ratio_th=args.inst_ratio)
-        ev_w, _ = build_evidence(warr, block, blk_dirs, cutoff,
+        ev_w, _ = build_evidence(warr_s, block_s, blk_dirs, cutoff,
                                  vol_lookback=args.vol_lookback)
         if ev_w.empty:
             continue
@@ -597,7 +665,7 @@ def main():
             print(f"   ⏱ {code} {name} 同向買入共振 {len(ws)} 窗：{'、'.join(_win_label(w) for w in ws)}")
 
     n_hist = append_signal_history(all_ev, latest)
-    print(f"📚 判定歷史 +{n_hist} 筆（{len(evs)} 窗）→ {SIGNAL_HISTORY_CSV}")
+    print(f"📚 判定歷史 +{n_hist} 筆（{len(evs)} 窗）→ {SIGNAL_HISTORY_BASE}/")
     write_report(ev, trades, latest, args, evs=evs, windows=windows, primary=primary)
 
 

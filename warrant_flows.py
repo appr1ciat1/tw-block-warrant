@@ -37,7 +37,7 @@ _CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT  # OpenSSL3 嚴格檢查會擋 TWSE
 API_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date}&type={type}&response=json"
 SIDES = (("call", "0999"), ("put", "0999P"))   # (側別, MI_INDEX type)
 _HERE = os.path.dirname(os.path.abspath(__file__))
-HISTORY_CSV = os.path.join(_HERE, "data", "warrant_flows.csv")
+HISTORY_BASE = os.path.join(_HERE, "data", "warrant_flows")   # 年度分檔目錄（storage.py）
 _REQUEST_PAUSE = 3.0   # TWSE 對高頻抓取會封鎖，務必保守
 TIMEOUT = 60
 
@@ -58,6 +58,15 @@ def _num(s):
         return float(str(s).replace(",", ""))
     except (ValueError, TypeError):
         return 0.0
+
+
+def _check_stat(d):
+    """TWSE 限流時會回假錯誤而非 429——當成非交易日跳過會留洞。
+    真的查無資料才回空，其餘一律 raise（由呼叫端記錄、heal 補洞）。"""
+    msg = str(d.get("stat"))
+    if "沒有符合條件" in msg or "查無" in msg:
+        return
+    raise RuntimeError(f"TWSE 異常回應（疑似限流）: {msg}")
 
 
 def _sign(html):
@@ -94,7 +103,8 @@ def fetch_warrant_flows(date_str, verbose=False):
     for side, mi_type in SIDES:
         d = _fetch_json(API_URL.format(date=ymd, type=mi_type))
         if d.get("stat") != "OK":
-            return pd.DataFrame(columns=COLUMNS)   # 非交易日
+            _check_stat(d)   # 限流假錯誤 → raise；真非交易日 → 空表
+            return pd.DataFrame(columns=COLUMNS)
         fields, data = _pick_table(d)
         if not data:
             continue
@@ -140,17 +150,16 @@ def fetch_warrant_flows(date_str, verbose=False):
     return df.reset_index(drop=True)
 
 
-def load_warrant_history(path=HISTORY_CSV):
-    """讀取累積歷史；不存在回空 DataFrame。"""
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=COLUMNS)
-    df = pd.read_csv(path, dtype={"underlying": str})
-    df["date"] = df["date"].astype(str)
-    return df
+from storage import load_history as _load_hist, save_history as _save_hist  # noqa: E402
 
 
-def update_warrant_history(path=HISTORY_CSV, backfill_days=0, end_date=None,
-                           deepen_to=None, verbose=True):
+def load_warrant_history(base=HISTORY_BASE, years=None):
+    """讀取累積歷史（年度分檔＋舊制單檔自動相容）；不存在回空 DataFrame。"""
+    return _load_hist(base, COLUMNS, years=years)
+
+
+def update_warrant_history(base=HISTORY_BASE, backfill_days=0, end_date=None,
+                           deepen_to=None, keep_years=None, verbose=True):
     """
     增量更新權證資金流歷史（邏輯同 block_trades.update_block_history）。
 
@@ -160,7 +169,7 @@ def update_warrant_history(path=HISTORY_CSV, backfill_days=0, end_date=None,
     - 同一日重跑整日覆蓋，避免重複列。
     """
     end = pd.Timestamp(end_date) if end_date else pd.Timestamp(date.today())
-    hist = load_warrant_history(path)
+    hist = load_warrant_history(base)
 
     if len(hist):
         start = pd.Timestamp(hist["date"].max()) + timedelta(days=1)
@@ -211,10 +220,8 @@ def update_warrant_history(path=HISTORY_CSV, backfill_days=0, end_date=None,
     if len(hist):
         hist = hist[~hist["date"].isin(new_dates)]
     merged = pd.concat([hist, new_df], ignore_index=True)
-    merged = merged.sort_values(["date", "underlying"]).reset_index(drop=True)
-
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    merged.to_csv(path, index=False)
+    merged = _save_hist(base, merged, keep_years=keep_years,
+                        sort_cols=("date", "underlying"))
     if verbose:
-        print(f"   ✅ [權證] 新增 {len(new_dates)} 日，累積 {len(merged)} 筆 → {path}")
+        print(f"   ✅ [權證] 新增 {len(new_dates)} 日，累積 {len(merged)} 筆 → {base}/")
     return merged
