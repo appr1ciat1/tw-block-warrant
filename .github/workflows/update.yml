@@ -13,6 +13,10 @@ on:
         description: '回補日曆日數（首次建歷史用）'
         required: false
         default: '0'
+      deepen_to:
+        description: '歷史往過去加深到 YYYY-MM-DD（API 下限：鉅額 2005-04-04、T86 2012-05-02）'
+        required: false
+        default: ''
 
 concurrency:
   group: daily-update
@@ -60,8 +64,13 @@ jobs:
 
       - name: Update data + signals + report
         if: steps.twcheck.outputs.is_trading == 'true'
+        timeout-minutes: 330
         run: |
-          python update.py --backfill "${{ github.event.inputs.backfill || '0' }}"
+          EXTRA=""
+          if [ -n "${{ github.event.inputs.deepen_to }}" ]; then
+            EXTRA="--deepen-to ${{ github.event.inputs.deepen_to }}"
+          fi
+          python update.py --backfill "${{ github.event.inputs.backfill || '0' }}" $EXTRA
 
       - name: Commit and push
         if: steps.twcheck.outputs.is_trading == 'true'

@@ -86,13 +86,24 @@ def fetch_inst_flows(date_str):
     if d.get("stat") != "OK" or not d.get("data"):
         return pd.DataFrame(columns=INST_COLUMNS)
     f = d["fields"]
+
+    def _idx(*names):
+        for n in names:
+            if n in f:
+                return f.index(n)
+        return None
+
+    # 欄位歷代變革：2012(12欄)/2015(16欄)用「外資買賣超股數」；2017-12 起(19欄)
+    # 拆成「外陸資(不含外資自營商)」+「外資自營商」兩欄
     i_code = f.index("證券代號")
-    i_for = f.index("外陸資買賣超股數(不含外資自營商)")
-    i_fdl = f.index("外資自營商買賣超股數")
-    i_tru = f.index("投信買賣超股數")
-    i_dlr = f.index("自營商買賣超股數")
-    i_tot = f.index("三大法人買賣超股數")
-    need = max(i_code, i_for, i_fdl, i_tru, i_dlr)
+    i_for = _idx("外陸資買賣超股數(不含外資自營商)", "外資買賣超股數")
+    i_fdl = _idx("外資自營商買賣超股數")            # 舊制無此欄 → None
+    i_tru = _idx("投信買賣超股數")
+    i_dlr = _idx("自營商買賣超股數")
+    i_tot = _idx("三大法人買賣超股數")
+    if None in (i_for, i_tru, i_dlr, i_tot):
+        raise ValueError(f"T86 欄位無法辨識: {f}")
+    need = max(x for x in (i_code, i_for, i_fdl, i_tru, i_dlr) if x is not None)
     iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
     rows = []
     for r in d["data"]:
@@ -103,7 +114,9 @@ def fetch_inst_flows(date_str):
         if len(r) > i_tot:
             tot = _num(r[i_tot])
         else:   # 缺合計欄 → 官方定義 fallback：外陸資+外資自營商+投信+自營商
-            parts = [for_n, _num(r[i_fdl]), tru_n, dlr_n]
+            parts = [for_n, tru_n, dlr_n]
+            if i_fdl is not None and len(r) > i_fdl:
+                parts.append(_num(r[i_fdl]))
             tot = float(pd.Series(parts).sum(skipna=True))
         rows.append({"date": iso, "code": str(r[i_code]).strip(),
                      "foreign_net": for_n, "trust_net": tru_n,
@@ -128,11 +141,12 @@ def load_inst_history(path=INST_CSV):
 
 
 def _update_history(path, columns, fetch_fn, label,
-                    first_start=None, end_date=None, verbose=True):
+                    first_start=None, end_date=None, deepen_to=None, verbose=True):
     """
     通用增量更新（邏輯同 block_trades.update_block_history）：
     - 首次執行（無歷史檔）：從 first_start 開始回補（預設今天）。
     - 之後：從歷史最後日期的次日補到 end_date（預設今天）。
+    - deepen_to：往「過去」回補——補齊 deepen_to → 歷史最早日前一日的缺口。
     - 同一日重跑整日覆蓋，避免重複列。
     """
     end = pd.Timestamp(end_date) if end_date else pd.Timestamp(date.today())
@@ -144,6 +158,14 @@ def _update_history(path, columns, fetch_fn, label,
         start = pd.Timestamp(first_start) if first_start else end
 
     days = [d for d in pd.date_range(start, end, freq="D") if d.weekday() < 5]
+
+    if deepen_to is not None and len(hist):
+        dmin = pd.Timestamp(hist["date"].min())
+        dt = pd.Timestamp(deepen_to)
+        if dt < dmin:
+            older = [d for d in pd.date_range(dt, dmin - timedelta(days=1), freq="D")
+                     if d.weekday() < 5]
+            days = older + days   # 先補舊、再補新
     if not days:
         if verbose:
             print(f"📦 [{label}] 歷史已是最新（至 {hist['date'].max() if len(hist) else '—'}）")
@@ -188,13 +210,17 @@ def _update_history(path, columns, fetch_fn, label,
     return merged
 
 
-def update_close_history(path=CLOSES_CSV, first_start=None, end_date=None, verbose=True):
+def update_close_history(path=CLOSES_CSV, first_start=None, end_date=None,
+                         deepen_to=None, verbose=True):
     """增量更新全市場收盤價。首次執行從 first_start（通常=鉅額歷史最早日）回補。"""
     return _update_history(path, CLOSE_COLUMNS, fetch_stock_closes, "收盤價",
-                           first_start=first_start, end_date=end_date, verbose=verbose)
+                           first_start=first_start, end_date=end_date,
+                           deepen_to=deepen_to, verbose=verbose)
 
 
-def update_inst_history(path=INST_CSV, first_start=None, end_date=None, verbose=True):
+def update_inst_history(path=INST_CSV, first_start=None, end_date=None,
+                        deepen_to=None, verbose=True):
     """增量更新三大法人買賣超。首次執行從 first_start（通常=鉅額歷史最早日）回補。"""
     return _update_history(path, INST_COLUMNS, fetch_inst_flows, "法人",
-                           first_start=first_start, end_date=end_date, verbose=verbose)
+                           first_start=first_start, end_date=end_date,
+                           deepen_to=deepen_to, verbose=verbose)

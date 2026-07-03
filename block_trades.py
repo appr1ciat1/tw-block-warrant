@@ -100,12 +100,14 @@ def load_block_history(path=HISTORY_CSV):
     return df
 
 
-def update_block_history(path=HISTORY_CSV, backfill_days=0, end_date=None, verbose=True):
+def update_block_history(path=HISTORY_CSV, backfill_days=0, end_date=None,
+                         deepen_to=None, verbose=True):
     """
     增量更新鉅額交易歷史。
 
     - 首次執行（無歷史檔）：回補 backfill_days 個「日曆日」（非交易日自動略過）。
     - 之後每日執行：從歷史最後日期的次日補到 end_date（預設今天）。
+    - deepen_to：往「過去」回補到指定日（API 下限 2005-04-04）。
     - 同一日重跑會整日覆蓋（先刪舊列再寫入），避免重複列。
 
     Returns
@@ -123,6 +125,14 @@ def update_block_history(path=HISTORY_CSV, backfill_days=0, end_date=None, verbo
     days = pd.date_range(start, end, freq="D")
     # 週末必非交易日，直接跳過省 API 次數；國定假日由 stat!=OK 過濾
     days = [d for d in days if d.weekday() < 5]
+
+    if deepen_to is not None and len(hist):
+        dmin = pd.Timestamp(hist["date"].min())
+        dt = pd.Timestamp(deepen_to)
+        if dt < dmin:
+            older = [d for d in pd.date_range(dt, dmin - timedelta(days=1), freq="D")
+                     if d.weekday() < 5]
+            days = older + days   # 先補舊、再補新
     if not days:
         if verbose:
             print(f"📦 [鉅額] 歷史已是最新（至 {hist['date'].max() if len(hist) else '—'}）")

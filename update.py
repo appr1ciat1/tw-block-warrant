@@ -29,13 +29,21 @@ block_warrant/update.py — 鉅額成交方向判定 × 權證同向訊號：每
 - 🔴 出貨避開：鉅額=賣 且權證無買盤
 - ⚪ 不明：權證成交太少（< min-call-value）或證據矛盾
 
-輸出：block_warrant/report.html + block_warrant/signals.json
-     + data/signal_history.csv（每日全部判定累積，供日後驗證各級後續報酬）
+═══ 時間段輪動偵查窗 ═══════════════════════════════════════════
+每日對五個偵查窗各判定一次（--windows 可調）：
+  近 5 / 10 / 15 / 20 個「交易日」＋ W3（上週三→本輪，週選結算週期錨定）。
+主窗（--primary-window，預設 10）出主表；多窗共振矩陣顯示跨窗一致性
+（🟢 共振 ≥2 窗更可信）。每窗判定都累積進 signal_history.csv（window 欄），
+供日後統計「哪個窗長最預測」。
+
+輸出：report.html / index.html + signals.json
+     + data/signal_history.csv（每日 窗×標的 判定累積，供日後驗證各級後續報酬）
 
 用法（任何工作目錄皆可）：
-    python block_warrant/update.py                  # 增量更新 + 出報表
-    python block_warrant/update.py --backfill 90    # 首次回補 90 個日曆日
-    python block_warrant/update.py --no-update      # 只用既有 CSV 出報表
+    python update.py                    # 增量更新 + 出報表
+    python update.py --backfill 90      # 首次回補 90 個日曆日
+    python update.py --no-update        # 只用既有 CSV 出報表
+    python update.py --deepen-to 2025-07-01   # 歷史往過去加深（供 Actions 跑）
 """
 
 import argparse
@@ -118,18 +126,36 @@ def classify_block_direction(block, closes, inst, cutoff,
     return b, stocks
 
 
-# ── 權證方向證據 + 鉅額標的判定 ─────────────────────────────────
-def build_evidence(warr, block, blk_dirs, vol_lookback=20, block_window=10):
+# ── 時間段輪動偵查窗 ────────────────────────────────────────────
+def window_cutoff(win, dates):
     """
-    以「近 block_window 日有鉅額成交的標的」為母體，逐檔計算權證方向證據，
-    並併入鉅額方向（blk_dirs，由 classify_block_direction 產生）。
+    偵查窗 → cutoff（ISO 日期字串，視窗 = date >= cutoff）。
+
+    win : int/str  數字 N = 最近 N 個「交易日」；'W3' = 上個週三起
+          （週三→下週三錨定窗；latest 為週三時涵蓋完整一輪週期）
+    dates : 已排序的交易日 ISO 字串 list（最新在最後）
+    """
+    s = str(win).strip().upper()
+    if s == "W3":
+        latest = pd.Timestamp(dates[-1])
+        off = (latest.weekday() - 2) % 7 or 7   # Mon=0…Wed=2；當天是週三→回推整週
+        return (latest - pd.Timedelta(days=off)).strftime("%Y-%m-%d")
+    n = int(s)
+    return dates[-n] if len(dates) >= n else dates[0]
+
+
+# ── 權證方向證據 + 鉅額標的判定 ─────────────────────────────────
+def build_evidence(warr, block, blk_dirs, cutoff, vol_lookback=20):
+    """
+    以「視窗內（date >= cutoff）有鉅額成交的標的」為母體，逐檔計算權證方向
+    證據，並併入鉅額方向（blk_dirs，由 classify_block_direction 產生）。
 
     Returns
     -------
     ev : pd.DataFrame  每個鉅額標的一列：
          blk_n / blk_value / blk_last / blk_dir / blk_wdir / blk_prem / blk_inst_ratio
          streak / vol_mult / buy_days / sell_days / call_net_win /
-         call_val_win / put_call_win / buy_ratio（權證證據）
+         call_val_win / put_call_win / buy_ratio（權證證據）/ win_len（窗內交易日數）
     latest : str  最新權證資料日
     """
     warr = warr[warr["underlying"].astype(str).str.match(STOCK_CODE)].copy()
@@ -137,7 +163,6 @@ def build_evidence(warr, block, blk_dirs, vol_lookback=20, block_window=10):
         return pd.DataFrame(), None
     dates = sorted(warr["date"].unique())
     latest = dates[-1]
-    cutoff = (pd.Timestamp(latest) - pd.Timedelta(days=block_window)).strftime("%Y-%m-%d")
     win_dates = [d for d in dates if d >= cutoff]   # 判定視窗（交易日）
 
     # 母體：視窗內有鉅額成交的標的
@@ -206,6 +231,7 @@ def build_evidence(warr, block, blk_dirs, vol_lookback=20, block_window=10):
         ev["blk_dir"] = "neutral"
     ev["blk_dir"] = ev["blk_dir"].fillna("neutral")
     ev["blk_wdir"] = ev["blk_wdir"].fillna(0.0)
+    ev["win_len"] = len(win_dates)
     return ev, latest
 
 
@@ -217,7 +243,9 @@ def classify(ev, args):
         sell_avoid(🔴 出貨避開) / unclear(⚪ 不明)
     """
     ev = ev.copy()
-    thin = ev["call_val_win"] < args.min_call_value
+    # 流動性底線隨窗長比例調整（<10 交易日的短窗按比例放寬，≥10 維持原門檻）
+    thin_th = args.min_call_value * (ev["win_len"].clip(upper=10) / 10.0)
+    thin = ev["call_val_win"] < thin_th
     strong = ((ev["streak"] >= args.streak_min)
               & (ev["vol_mult"].fillna(0) >= args.vol_mult))
     bearish = (ev["call_net_win"] < 0) | (ev["put_call_win"].fillna(0) >= 1.0)
@@ -240,11 +268,12 @@ def classify(ev, args):
 
 
 def append_signal_history(ev, latest, path=SIGNAL_HISTORY_CSV):
-    """把當日全部鉅額標的判定 append 到歷史（同日重跑覆蓋），供日後統計各級後續報酬。"""
-    cols = ["date", "code", "name", "verdict", "score",
+    """把當日全部（窗×標的）判定 append 到歷史（同日重跑覆蓋），供日後統計各級後續報酬。"""
+    cols = ["date", "window", "code", "name", "verdict", "score",
             "blk_dir", "blk_wdir", "blk_prem", "blk_inst_ratio",
             "streak", "vol_mult", "buy_days", "sell_days", "call_net_win",
-            "call_val_win", "put_call_win", "buy_ratio", "blk_n", "blk_value", "blk_last"]
+            "call_val_win", "put_call_win", "buy_ratio", "blk_n", "blk_value",
+            "blk_last", "win_len"]
     today = ev.copy()
     today.insert(0, "date", latest)
     today = today[cols]
@@ -294,7 +323,64 @@ _THEAD = ("<tr><th>判定</th><th>標的</th><th>鉅額方向</th><th>溢折價<
 _NCOL = 12
 
 
-def write_report(ev, trades, latest, args):
+_WIN_LABEL = {"W3": "週三→下週三"}
+
+
+def _win_label(w):
+    return _WIN_LABEL.get(str(w).upper(), f"近{w}交易日")
+
+
+def _resonance_card(evs, windows, primary):
+    """多窗共振矩陣：每檔 × 每窗的判定，統計 🟢/🚫 共振數。"""
+    frames = {w: evs[w].set_index("code") for w in windows if w in evs}
+    if not frames:
+        return ""
+    codes = {}
+    for w, df in frames.items():
+        for code, r in df.iterrows():
+            if r["verdict"] == "unclear":
+                continue
+            codes.setdefault(code, {"name": r["name"], "blk_value": 0.0})
+            codes[code]["blk_value"] = max(codes[code]["blk_value"], float(r["blk_value"]))
+    if not codes:
+        return ""
+
+    rows = []
+    for code, meta in codes.items():
+        cells, n_buy, n_hedge = [], 0, 0
+        for w in windows:
+            df = frames.get(w)
+            if df is None or code not in df.index:
+                cells.append("·")
+                continue
+            v = df.loc[code, "verdict"]
+            cells.append(_TAG[v].split()[0])
+            n_buy += v == "same_dir_buy"
+            n_hedge += v == "hedge_suspect"
+        rows.append((n_buy, n_hedge, meta["blk_value"], code, meta["name"], cells))
+    rows.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+
+    head = "".join(f"<th>{_win_label(w)}</th>" for w in windows)
+    body = []
+    for n_buy, n_hedge, _, code, name, cells in rows[:80]:
+        cls = ' class="hl"' if n_buy >= 2 else (' class="hl3"' if n_hedge >= 2 else "")
+        body.append(f"<tr{cls}><td><b>{code}</b> {name}</td>"
+                    + "".join(f"<td>{c}</td>" for c in cells)
+                    + f"<td>{n_buy}</td><td>{n_hedge}</td></tr>")
+    return f"""
+<div class="card">
+ <h2>⏱ 時間段輪動偵查（多窗共振）</h2>
+ <p class="gsub">同一標的在 {len(windows)} 個偵查窗（{' / '.join(_win_label(w) for w in windows)}）
+ 的判定。🟢 共振 ≥ 2 窗 = 同向買入訊號跨窗成立（更可信）；🚫 共振 ≥ 2 窗 = 避險換倉形態跨窗成立。
+ 「·」= 該窗內無鉅額成交（不在母體）。主窗 = {_win_label(primary)}。</p>
+ <div class="tbl"><table>
+  <tr><th>標的</th>{head}<th>🟢共振</th><th>🚫共振</th></tr>
+  {''.join(body)}
+ </table></div>
+</div>"""
+
+
+def write_report(ev, trades, latest, args, evs=None, windows=(), primary=""):
     buy_tbl = ev[ev["verdict"] == "same_dir_buy"].sort_values("score", ascending=False)
     hedge_tbl = ev[ev["verdict"] == "hedge_suspect"].sort_values("blk_value", ascending=False)
     all_tbl = ev.copy()
@@ -346,8 +432,8 @@ def write_report(ev, trades, latest, args):
  footer{{color:#64748b;font-size:.78rem;margin-top:16px;line-height:1.6}}
 </style></head><body><div class="wrap">
 <h1>🧲 鉅額成交方向判定 × 權證同向訊號</h1>
-<p class="sub">資料日：<b>{latest}</b> · 獨立策略 · 每日收盤後自動更新 ·
-母體 = 近 {args.block_window} 日有鉅額成交的標的 ·
+<p class="sub">資料日：<b>{latest}</b> · 獨立策略 · 每交易日 19:00 (TW) 自動更新 ·
+偵查窗輪動：{' / '.join(_win_label(w) for w in windows)}（主窗 = {_win_label(primary)}，以下三表皆為主窗）·
 鉅額方向 = 溢折價（vs 收盤價，門檻 ±{args.prem_th * 100:.1f}%）+ 同日法人買賣超比對（門檻 ±{args.inst_ratio:.1f}×）兩條獨立證據，金額加權</p>
 
 <div class="card">
@@ -384,8 +470,10 @@ def write_report(ev, trades, latest, args):
  </table></div>
 </div>
 
+{_resonance_card(evs, list(windows), primary) if evs else ""}
+
 <div class="card">
- <h2>📋 近 {args.block_window} 日鉅額交易逐筆明細（金額前 30）</h2>
+ <h2>📋 主窗（{_win_label(primary)}）鉅額交易逐筆明細（金額前 30）</h2>
  <p class="gsub">溢折價 = 成交價/當日收盤 − 1（+溢價偏買、−折價偏賣、貼平盤中性）·
  法人比 = 同日三大法人買賣超金額 ÷ 該筆鉅額金額 · 方向 = 兩證據平均。</p>
  <div class="tbl"><table>
@@ -407,12 +495,18 @@ def write_report(ev, trades, latest, args):
     payload = {
         "date": latest,
         "params": {"streak_min": args.streak_min, "vol_mult": args.vol_mult,
-                   "vol_lookback": args.vol_lookback, "block_window": args.block_window,
+                   "vol_lookback": args.vol_lookback,
+                   "windows": list(windows), "primary_window": primary,
                    "min_call_value": args.min_call_value,
                    "prem_th": args.prem_th, "inst_ratio": args.inst_ratio},
         "buy_signals": buy_tbl.to_dict("records"),
         "excluded_hedge": hedge_tbl.to_dict("records"),
         "block_directions": all_tbl.to_dict("records"),
+        "windows": {w: {
+            "buy_signals": e[e["verdict"] == "same_dir_buy"]
+            .sort_values("score", ascending=False).to_dict("records"),
+            "excluded_hedge": e[e["verdict"] == "hedge_suspect"].to_dict("records"),
+        } for w, e in (evs or {}).items()},
     }
     with open(SIGNALS_JSON, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=1, default=str)
@@ -427,51 +521,64 @@ def main():
     ap.add_argument("--vol-mult", type=float, default=2.0, help="量能倍數門檻(vs 中位數)")
     ap.add_argument("--vol-lookback", type=int, default=20, help="量能基期(交易日)")
     ap.add_argument("--min-call-value", type=float, default=10_000_000,
-                    help="視窗內最低認購成交金額(元)，低於此判定=不明")
-    ap.add_argument("--block-window", type=int, default=10, help="鉅額成交回看日曆日數(母體視窗)")
+                    help="視窗內最低認購成交金額(元)，低於此判定=不明；短窗按比例放寬")
+    ap.add_argument("--windows", default="5,10,15,20,W3",
+                    help="偵查窗輪動：逗號分隔，數字=最近N交易日，W3=週三→下週三")
+    ap.add_argument("--primary-window", default="10", help="主窗（報表主表用）")
     ap.add_argument("--prem-th", type=float, default=0.005,
                     help="溢折價方向門檻(0.005=±0.5%%)")
     ap.add_argument("--inst-ratio", type=float, default=0.5,
                     help="法人買賣超金額/鉅額金額 的方向門檻")
+    ap.add_argument("--deepen-to", default=None,
+                    help="往過去回補歷史到指定日(YYYY-MM-DD)；API 下限：鉅額 2005-04-04、T86 2012-05-02")
     args = ap.parse_args()
 
     if args.no_update:
         block, warr = load_block_history(), load_warrant_history()
         closes, inst = load_close_history(), load_inst_history()
     else:
-        block = update_block_history(backfill_days=args.backfill)
-        warr = update_warrant_history(backfill_days=args.backfill)
+        block = update_block_history(backfill_days=args.backfill, deepen_to=args.deepen_to)
+        warr = update_warrant_history(backfill_days=args.backfill, deepen_to=args.deepen_to)
         # 方向參考資料：首次從鉅額歷史最早日回補，之後增量
         first = block["date"].min() if len(block) else None
-        closes = update_close_history(first_start=first)
-        inst = update_inst_history(first_start=first)
+        closes = update_close_history(first_start=first, deepen_to=args.deepen_to)
+        inst = update_inst_history(first_start=first, deepen_to=args.deepen_to)
 
     if not len(warr) or not len(block):
         print("⚠️ 尚無足夠歷史資料，先跑 --backfill 回補")
         return
 
-    # 先以最新權證資料日決定視窗，再判定視窗內鉅額方向
     warr_dates = sorted(warr[warr["underlying"].astype(str).str.match(STOCK_CODE)]["date"].unique())
     if not warr_dates:
         print("⚠️ 權證歷史為空")
         return
-    latest = warr_dates[-1]
-    cutoff = (pd.Timestamp(latest) - pd.Timedelta(days=args.block_window)).strftime("%Y-%m-%d")
 
-    trades, blk_dirs = classify_block_direction(
-        block, closes, inst, cutoff,
-        prem_th=args.prem_th, inst_ratio_th=args.inst_ratio)
+    # ── 時間段輪動：每個偵查窗各判定一次 ──
+    windows = [w.strip().upper() if w.strip().upper() == "W3" else w.strip()
+               for w in args.windows.split(",") if w.strip()]
+    evs, trades_by_win, latest = {}, {}, warr_dates[-1]
+    for w in windows:
+        cutoff = window_cutoff(w, warr_dates)
+        trades_w, blk_dirs = classify_block_direction(
+            block, closes, inst, cutoff,
+            prem_th=args.prem_th, inst_ratio_th=args.inst_ratio)
+        ev_w, _ = build_evidence(warr, block, blk_dirs, cutoff,
+                                 vol_lookback=args.vol_lookback)
+        if ev_w.empty:
+            continue
+        ev_w = classify(ev_w, args)
+        ev_w["window"] = str(w)
+        evs[str(w)] = ev_w
+        trades_by_win[str(w)] = trades_w
 
-    ev, latest = build_evidence(warr, block, blk_dirs,
-                                vol_lookback=args.vol_lookback,
-                                block_window=args.block_window)
-    if ev.empty:
-        print(f"⚠️ 近 {args.block_window} 日無鉅額成交標的")
+    if not evs:
+        print("⚠️ 各偵查窗內皆無鉅額成交標的")
         return
-    ev = classify(ev, args)
+    primary = args.primary_window if args.primary_window in evs else next(iter(evs))
+    ev, trades = evs[primary], trades_by_win[primary]
 
     counts = ev["verdict"].value_counts()
-    print(f"🧲 {latest}: 鉅額標的 {len(ev)} 檔 → "
+    print(f"🧲 {latest} 主窗[{_win_label(primary)}]: 鉅額標的 {len(ev)} 檔 → "
           f"🟢同向買入 {counts.get('same_dir_buy', 0)} · 🟡偏買 {counts.get('lean_buy', 0)} · "
           f"🚫避險換倉 {counts.get('hedge_suspect', 0)} · "
           f"🔴出貨 {counts.get('sell_avoid', 0)} · ⚪不明 {counts.get('unclear', 0)}")
@@ -481,9 +588,17 @@ def main():
     for r in ev[ev["verdict"] == "hedge_suspect"].itertuples():
         print(f"   🚫 {r.code} {r.name}  鉅額▽賣({r.blk_wdir:+.2f}) 但權證有買盤 → 賣現貨買權證嫌疑，剔除")
 
-    n_hist = append_signal_history(ev, latest)
-    print(f"📚 判定歷史 +{n_hist} 筆 → {SIGNAL_HISTORY_CSV}")
-    write_report(ev, trades, latest, args)
+    # 多窗共振摘要
+    all_ev = pd.concat(evs.values(), ignore_index=True)
+    reso = (all_ev[all_ev["verdict"] == "same_dir_buy"].groupby(["code", "name"])["window"]
+            .agg(list))
+    for (code, name), ws in reso.items():
+        if len(ws) >= 2:
+            print(f"   ⏱ {code} {name} 同向買入共振 {len(ws)} 窗：{'、'.join(_win_label(w) for w in ws)}")
+
+    n_hist = append_signal_history(all_ev, latest)
+    print(f"📚 判定歷史 +{n_hist} 筆（{len(evs)} 窗）→ {SIGNAL_HISTORY_CSV}")
+    write_report(ev, trades, latest, args, evs=evs, windows=windows, primary=primary)
 
 
 if __name__ == "__main__":
