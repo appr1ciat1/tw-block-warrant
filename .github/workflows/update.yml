@@ -17,6 +17,10 @@ on:
         description: '歷史往過去加深到 YYYY-MM-DD（API 下限：鉅額 2005-04-04、T86 2012-05-02）'
         required: false
         default: ''
+      pause:
+        description: '深挖每請求間隔秒數（越大越不易觸發 TWSE 封鎖，但越慢；預設 6）'
+        required: false
+        default: '6'
 
 concurrency:
   group: daily-update
@@ -69,7 +73,7 @@ jobs:
           EXTRA=""
           if [ -n "${{ github.event.inputs.deepen_to }}" ]; then
             EXTRA="--deepen-to ${{ github.event.inputs.deepen_to }}"
-            export TWSTK_PAUSE=6   # 深挖放慢節奏，降低觸發 TWSE 反爬蟲(307封鎖)機率
+            export TWSTK_PAUSE="${{ github.event.inputs.pause || '6' }}"  # 深挖節奏，降低觸發 TWSE 封鎖
           fi
           python update.py --backfill "${{ github.event.inputs.backfill || '0' }}" $EXTRA
 
