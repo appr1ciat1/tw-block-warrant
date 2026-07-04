@@ -45,18 +45,16 @@ _CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT  # OpenSSL3 嚴格檢查會擋 TWSE
 API_URL = "https://www.twse.com.tw/rwd/zh/block/BFIAUU?date={date}&selectType=S&response=json"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 HISTORY_BASE = os.path.join(_HERE, "data", "block_trades")   # 年度分檔目錄（storage.py）
-_REQUEST_PAUSE = 3.0   # TWSE 對高頻抓取會封鎖，務必保守
 TIMEOUT = 30
 
 COLUMNS = ["date", "code", "name", "trade_type", "price", "shares", "value"]
 
 from storage import load_history as _load_hist, save_history as _save_hist  # noqa: E402
+from twse_http import fetch_json as _http_fetch, REQUEST_PAUSE as _REQUEST_PAUSE  # noqa: E402
 
 
 def _fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "twstk/1.0"})
-    with urllib.request.urlopen(req, context=_CTX, timeout=TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    return _http_fetch(url, timeout=TIMEOUT)   # 含 retry-backoff（反爬蟲退避）
 
 
 def _num(s):

@@ -36,17 +36,16 @@ T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86?date={date}&selectType=ALLBUT
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CLOSES_BASE = os.path.join(_HERE, "data", "stock_closes")   # 年度分檔目錄（storage.py）
 INST_BASE = os.path.join(_HERE, "data", "inst_flows")
-_REQUEST_PAUSE = 3.0   # TWSE 對高頻抓取會封鎖，務必保守
 TIMEOUT = 60
 
 CLOSE_COLUMNS = ["date", "code", "close"]
 INST_COLUMNS = ["date", "code", "foreign_net", "trust_net", "dealer_net", "total_net"]
 
+from twse_http import fetch_json as _http_fetch, REQUEST_PAUSE as _REQUEST_PAUSE  # noqa: E402
+
 
 def _fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "twstk/1.0"})
-    with urllib.request.urlopen(req, context=_CTX, timeout=TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    return _http_fetch(url, timeout=TIMEOUT)   # 含 retry-backoff（反爬蟲退避）
 
 
 def _num(s):

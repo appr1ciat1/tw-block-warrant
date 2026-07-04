@@ -38,7 +38,6 @@ API_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date}&type
 SIDES = (("call", "0999"), ("put", "0999P"))   # (側別, MI_INDEX type)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 HISTORY_BASE = os.path.join(_HERE, "data", "warrant_flows")   # 年度分檔目錄（storage.py）
-_REQUEST_PAUSE = 3.0   # TWSE 對高頻抓取會封鎖，務必保守
 TIMEOUT = 60
 
 _METRICS = ("value", "volume", "trades", "up_value", "down_value", "n")
@@ -46,11 +45,11 @@ COLUMNS = ["date", "underlying", "underlying_name"] + [
     f"{side}_{m}" for side, _ in SIDES for m in _METRICS
 ]
 
+from twse_http import fetch_json as _http_fetch, REQUEST_PAUSE as _REQUEST_PAUSE  # noqa: E402
+
 
 def _fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "twstk/1.0"})
-    with urllib.request.urlopen(req, context=_CTX, timeout=TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    return _http_fetch(url, timeout=TIMEOUT)   # 含 retry-backoff（反爬蟲退避）
 
 
 def _num(s):

@@ -69,6 +69,7 @@ jobs:
           EXTRA=""
           if [ -n "${{ github.event.inputs.deepen_to }}" ]; then
             EXTRA="--deepen-to ${{ github.event.inputs.deepen_to }}"
+            export TWSTK_PAUSE=6   # 深挖放慢節奏，降低觸發 TWSE 反爬蟲(307封鎖)機率
           fi
           python update.py --backfill "${{ github.event.inputs.backfill || '0' }}" $EXTRA
 
