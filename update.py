@@ -47,6 +47,7 @@ block_warrant/update.py — 鉅額成交方向判定 × 權證同向訊號：每
 """
 
 import argparse
+import html
 import json
 import os
 import re
@@ -54,6 +55,22 @@ import sys
 import time
 
 import pandas as pd
+
+
+def _enable_utf8_console():
+    """Windows 主控台預設 cp950，print emoji 會 UnicodeEncodeError 中斷腳本。
+    入口把 stdout/stderr 轉 UTF-8（errors='replace' 保底不炸）。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def _esc(x):
+    """HTML 轉義動態欄位（TWSE 名稱/交易別等，防破版/注入）。"""
+    return html.escape(str(x))
+
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)   # 讓 update.py 從任何 CWD 都能 import 同資料夾模組
@@ -73,6 +90,32 @@ SIGNALS_JSON = os.path.join(_HERE, "signals.json")
 SIGNAL_HISTORY_BASE = os.path.join(_HERE, "data", "signal_history")   # 年度分檔
 STOCK_CODE = re.compile(r"^\d{4,6}$")   # 個股/ETF；排除 IX0001 等指數標的
 SLICE_DAYS = 200   # 訊號計算只需近期資料；深歷史留給 validate.py
+
+# signals.json 正式 schema（內嵌於輸出 "schema" 欄，供串接者對照；詳見 SCHEMA.md）
+SIGNALS_SCHEMA = {
+    "date": "資料日 (YYYY-MM-DD)",
+    "primary_window": "主窗名稱（頂層 buy_signals/excluded_hedge/block_directions 皆此窗）",
+    "params": "本次計算參數（門檻/偵查窗等）",
+    "buy_signals": "主窗 🟢 同向買入清單（record 陣列，欄位見 record_fields）",
+    "excluded_hedge": "主窗 🚫 避險換倉剔除清單",
+    "block_directions": "主窗全部鉅額標的判定（完整表）",
+    "windows": "各偵查窗 → {buy_signals, excluded_hedge, block_directions}（每窗完整表）",
+    "record_fields": {
+        "code": "標的代號", "name": "標的名稱",
+        "verdict": "same_dir_buy/lean_buy/hedge_suspect/sell_avoid/unclear",
+        "score": "排序分數（含權證品質降權）", "window": "偵查窗",
+        "blk_dir": "鉅額方向 buy/sell/neutral", "blk_wdir": "方向分數 [-1,1]",
+        "blk_prem": "金額加權溢折價", "blk_inst_ratio": "窗內法人金額/鉅額金額",
+        "streak": "認購連買日", "vol_mult": "當日認購額/前20日中位數倍數",
+        "buy_days": "窗內認購買方日", "sell_days": "窗內認購賣方日",
+        "call_net_win": "窗內認購淨買壓(元)", "call_val_win": "窗內認購成交額(元)",
+        "put_call_win": "窗內認售/認購額比", "blk_n": "窗內鉅額筆數",
+        "blk_value": "窗內鉅額金額(元)", "blk_last": "最近鉅額日",
+        "wq": "權證品質分 [0,1]（NaN=未知）",
+        "call_spread": "認購相對買賣價差（雙邊報價權證，成交額加權）",
+        "call_quote_ratio": "雙邊報價成交額佔認購比例",
+    },
+}
 
 
 # ── 鉅額方向：獨立證據（溢折價 + 法人）───────────────────────────
@@ -99,8 +142,13 @@ def classify_block_direction(block, closes, inst, cutoff,
     b = b.merge(inst[["date", "code", "total_net"]], on=["date", "code"], how="left")
 
     b["prem"] = b["price"] / b["close"] - 1.0
+    # 法人比 = 當日三大法人買賣超金額 ÷ 當日該股鉅額「總」金額。
+    # total_net 是「整檔整日」一個值（T86 每 date,code 一列）；一檔當日常有多筆
+    # 鉅額，分母必須用檔級當日鉅額總額，不能用單筆 value（否則 inst 證據被筆數
+    # 放大、過度觸發、污染方向判定，並使聚合 blk_inst_ratio 被筆數 n 重複放大）。
+    day_val = b.groupby(["date", "code"])["value"].transform("sum")
     b["inst_value"] = b["total_net"] * b["close"]          # 法人買賣超金額(近似)
-    b["inst_ratio"] = b["inst_value"] / b["value"].where(b["value"] > 0)
+    b["inst_ratio"] = b["inst_value"] / day_val.where(day_val > 0)
 
     price_ev = pd.Series(0.0, index=b.index)
     price_ev[b["prem"] >= prem_th] = 1.0
@@ -182,18 +230,33 @@ def build_evidence(warr, block, blk_dirs, cutoff, vol_lookback=20):
     num_cols = [c for c in warr.columns if c not in ("date", "underlying", "underlying_name")]
     warr_g = {u: g for u, g in warr.groupby("underlying")}
 
+    _QNAN = {"call_spread": float("nan"), "call_quote_ratio": float("nan"),
+             "call_bidqty": float("nan"), "call_askqty": float("nan")}
+
+    def _quality(g0):
+        """取『最新資料日』該標的認購權證品質（缺欄/未交易 → NaN，不參與降權）。"""
+        if g0 is None:
+            return dict(_QNAN)
+        qr = g0[g0["date"] == latest]
+        if not len(qr):
+            return dict(_QNAN)
+        q = qr.iloc[-1]
+        return {k: (float(q[k]) if (k in q and pd.notna(q[k])) else float("nan"))
+                for k in _QNAN}
+
     rows = []
     for code, b in blk.iterrows():
-        g = warr_g.get(code)
-        if g is None:
+        g0 = warr_g.get(code)
+        qual = _quality(g0)
+        if g0 is None:
             rows.append({"code": code, "name": b["name"], "blk_n": int(b.blk_n),
                          "blk_value": float(b.blk_value), "blk_last": b.blk_last,
                          "streak": 0, "vol_mult": float("nan"), "buy_days": 0,
                          "sell_days": 0, "call_net_win": 0.0, "call_val_win": 0.0,
-                         "put_call_win": float("nan"), "buy_ratio": 0.0})
+                         "put_call_win": float("nan"), "buy_ratio": 0.0, **qual})
             continue
 
-        g = g.set_index("date")[num_cols].reindex(dates).fillna(0.0)
+        g = g0.set_index("date")[num_cols].reindex(dates).fillna(0.0)
         cv = g["call_value"]
         net = g["call_up_value"] - g["call_down_value"]
 
@@ -227,6 +290,7 @@ def build_evidence(warr, block, blk_dirs, cutoff, vol_lookback=20):
             "call_val_win": call_val_win,
             "put_call_win": (put_val_win / call_val_win) if call_val_win > 0 else float("nan"),
             "buy_ratio": (float(g["call_up_value"].iloc[-1]) / last_cv) if last_cv > 0 else 0.0,
+            **qual,
         })
     ev = pd.DataFrame(rows)
     if len(blk_dirs):
@@ -239,6 +303,19 @@ def build_evidence(warr, block, blk_dirs, cutoff, vol_lookback=20):
     ev["blk_wdir"] = ev["blk_wdir"].fillna(0.0)
     ev["win_len"] = len(win_dates)
     return ev, latest
+
+
+def warrant_quality(ev):
+    """
+    認購權證品質分 ∈ [0,1]（NaN = 品質未知，不降權）。爛流動性=假訊號，用來降權：
+    - 相對買賣價差 q_spread（主）：雙邊報價權證的成交額加權價差，≥6% 記 0 分。
+    - 雙邊報價比 q_quote（次）：雙邊都掛報價的成交額佔比（造市穩定度）。
+    價差 NaN（無任何雙邊報價權證）→ 回 NaN 視為未知不降權（保守）。
+    （剩餘天數/到期日官方無乾淨 API，不納入；見 warrant_flows 說明。）
+    """
+    q_spread = (1.0 - ev["call_spread"] / 0.06).clip(0, 1)
+    q_quote = ev["call_quote_ratio"].clip(0, 1).fillna(0.5)
+    return 0.6 * q_spread + 0.4 * q_quote
 
 
 def classify(ev, args):
@@ -267,28 +344,36 @@ def classify(ev, args):
     ev.loc[~thin & blk_neutral & strong & ~bearish, "verdict"] = "lean_buy"
     ev.loc[~thin & blk_buy & strong & ~bearish, "verdict"] = "same_dir_buy"
 
-    # 分數 = 權證強度 ×（1 + 鉅額方向加權），僅供排序
+    # 權證品質分：爛流動性權證的假訊號降權（品質未知→factor=1 不降權；最差保留 35%）
+    ev["wq"] = warrant_quality(ev)
+    qfac = 0.35 + 0.65 * ev["wq"].fillna(1.0)
+
+    # 分數 = 權證強度 ×（1 + 鉅額方向加權）× 品質係數，僅供排序（判定矩陣不受影響）
     ev["score"] = (ev["streak"] * ev["vol_mult"].fillna(0).clip(upper=5.0)
-                   * (1.0 + ev["blk_wdir"].fillna(0)))
+                   * (1.0 + ev["blk_wdir"].fillna(0)) * qfac)
     return ev
 
 
 def append_signal_history(ev, latest, base=SIGNAL_HISTORY_BASE):
-    """把當日全部（窗×標的）判定 append 到歷史（同日重跑覆蓋），供日後統計各級後續報酬。"""
+    """
+    把當日全部（窗×標的）判定 append 到歷史（同日重跑整日覆蓋），供日後統計後續報酬。
+    回傳 (今日筆數, 覆蓋掉的舊同日筆數)——讓呼叫端不會把「同日覆蓋」誤報成「淨新增」。
+    """
     cols = ["date", "window", "code", "name", "verdict", "score",
             "blk_dir", "blk_wdir", "blk_prem", "blk_inst_ratio",
             "streak", "vol_mult", "buy_days", "sell_days", "call_net_win",
             "call_val_win", "put_call_win", "buy_ratio", "blk_n", "blk_value",
-            "blk_last", "win_len"]
+            "blk_last", "win_len", "wq", "call_spread", "call_quote_ratio"]
     today = ev.copy()
     today.insert(0, "date", latest)
-    today = today[cols]
+    today = today.reindex(columns=cols)
 
     hist = _load_hist(base, cols, years=1)   # 去重只需當年檔（舊制單檔自動併入遷移）
+    old_same = int((hist["date"] == latest).sum())   # 檔內既有的同日列數
     hist = hist[hist["date"] != latest]
     merged = pd.concat([hist, today], ignore_index=True)
     _save_hist(base, merged, sort_cols=("date", "window", "code"))
-    return len(today)
+    return len(today), old_same
 
 
 # ── 補洞：TWSE 限流時 stat!=OK 會被當「非交易日」靜默跳過而留洞 ──
@@ -300,14 +385,17 @@ def heal_recent(block, warr, closes, inst, days=45, keep_years=None, verbose=Tru
     """
     if not days:
         return block, warr, closes, inst
-    all_dates = set()
+    from collections import Counter
+    cnt = Counter()
     for df in (block, warr, closes, inst):
         if len(df):
-            all_dates.update(df["date"])
-    if not all_dates:
+            cnt.update(set(df["date"]))
+    if not cnt:
         return block, warr, closes, inst
-    cutoff = (pd.Timestamp(max(all_dates)) - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
-    ref = {d for d in all_dates if d >= cutoff}
+    cutoff = (pd.Timestamp(max(cnt)) - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+    # 多數決：≥2 源皆有的日期才當可信交易日參考，避免單源幽靈日（盤中幽靈/某源
+    # 部分表）被當交易日而每天對其他源做無效重試（含退避）浪費時間。
+    ref = {d for d, c in cnt.items() if c >= 2 and d >= cutoff}
 
     def _heal(name, df, fetch_fn, base, sort_cols):
         own = set(df["date"])
@@ -351,24 +439,60 @@ def _fmt_m(v):
     return f"{v / 1e6:,.1f}"
 
 
+def _fmt_ratio(v, cap=10.0):
+    """法人比顯示：|值|≥cap 顯示 ±cap↑（法人流量遠大於鉅額，超過此意義不大）。"""
+    if pd.isna(v):
+        return "—"
+    if v >= cap:
+        return f"+{cap:.0f}↑"
+    if v <= -cap:
+        return f"−{cap:.0f}↑"
+    return f"{v:+.2f}"
+
+
+def _stk_cell(code, name):
+    """標的欄：連 Yahoo 股價頁（上市 .TW），並 html 轉義。"""
+    c, n = _esc(code), _esc(name)
+    return (f'<td class="stk"><a href="https://tw.stock.yahoo.com/quote/{c}.TW" '
+            f'target="_blank" rel="noopener"><b>{c}</b> {n}</a></td>')
+
+
+def _quality_cell(r):
+    """權證品質欄：優/中/⚠️差 + 價差% · 雙邊報價比（品質未知→—）。"""
+    wq = getattr(r, "wq", float("nan"))
+    if pd.isna(wq):
+        return "<td>—</td>"
+    tier = "優" if wq >= 0.7 else ("中" if wq >= 0.4 else "⚠️差")
+    bits = []
+    if pd.notna(getattr(r, "call_spread", float("nan"))):
+        bits.append(f"價差{r.call_spread * 100:.1f}%")
+    if pd.notna(getattr(r, "call_quote_ratio", float("nan"))):
+        bits.append(f"雙邊{r.call_quote_ratio * 100:.0f}%")
+    sub = f"<span class='qsub'> {'·'.join(bits)}</span>" if bits else ""
+    cls = ' class="qbad"' if wq < 0.4 else ""
+    return f"<td{cls}>{tier}{sub}</td>"
+
+
 def _row_html(r):
     vm = f"{r.vol_mult:.1f}×" if pd.notna(r.vol_mult) else "—"
     pc = f"{r.put_call_win:.2f}" if pd.notna(r.put_call_win) else "—"
     prem = f"{r.blk_prem * 100:+.2f}%" if pd.notna(r.blk_prem) else "—"
-    ir = f"{r.blk_inst_ratio:+.2f}" if pd.notna(r.blk_inst_ratio) else "—"
+    ir = _fmt_ratio(r.blk_inst_ratio)
     return (f"<tr{_CLS[r.verdict]}><td>{_TAG[r.verdict]}</td>"
-            f"<td><b>{r.code}</b> {r.name}</td>"
+            f"{_stk_cell(r.code, r.name)}"
             f"<td>{_DIR.get(r.blk_dir, '–')} ({r.blk_wdir:+.2f})</td>"
             f"<td>{prem}</td><td>{ir}</td>"
-            f"<td>{r.blk_n} 筆 / {_fmt_m(r.blk_value)}M</td><td>{r.blk_last[5:]}</td>"
+            f"<td>{r.blk_n} 筆 / {_fmt_m(r.blk_value)}M</td><td>{_esc(r.blk_last[5:])}</td>"
             f"<td>{r.streak}</td><td>{vm}</td><td>{r.buy_days}/{r.sell_days}</td>"
-            f"<td>{_fmt_m(r.call_net_win)}</td><td>{pc}</td></tr>")
+            f"<td>{_fmt_m(r.call_net_win)}</td><td>{pc}</td>"
+            f"{_quality_cell(r)}</tr>")
 
 
 _THEAD = ("<tr><th>判定</th><th>標的</th><th>鉅額方向</th><th>溢折價</th><th>法人比</th>"
           "<th>鉅額(視窗)</th><th>最近鉅額</th>"
-          "<th>連買(日)</th><th>量能</th><th>買/賣日</th><th>認購淨買壓(百萬)</th><th>Put/Call</th></tr>")
-_NCOL = 12
+          "<th>連買(日)</th><th>量能</th><th>買/賣日</th><th>認購淨買壓(百萬)</th>"
+          "<th>Put/Call</th><th>品質</th></tr>")
+_NCOL = 13
 
 
 _WIN_LABEL = {"W3": "週三→下週三"}
@@ -412,7 +536,7 @@ def _resonance_card(evs, windows, primary):
     body = []
     for n_buy, n_hedge, _, code, name, cells in rows[:80]:
         cls = ' class="hl"' if n_buy >= 2 else (' class="hl3"' if n_hedge >= 2 else "")
-        body.append(f"<tr{cls}><td><b>{code}</b> {name}</td>"
+        body.append(f"<tr{cls}>{_stk_cell(code, name)}"
                     + "".join(f"<td>{c}</td>" for c in cells)
                     + f"<td>{n_buy}</td><td>{n_hedge}</td></tr>")
     return f"""
@@ -450,9 +574,9 @@ def write_report(ev, trades, latest, args, evs=None, windows=(), primary=""):
         rws = []
         for r in recent.itertuples():
             prem = f"{r.prem * 100:+.2f}%" if pd.notna(r.prem) else "—"
-            ir = f"{r.inst_ratio:+.2f}" if pd.notna(r.inst_ratio) else "—"
+            ir = _fmt_ratio(r.inst_ratio)
             rws.append(
-                f"<tr><td>{r.date}</td><td><b>{r.code}</b> {r.name}</td><td>{r.trade_type}</td>"
+                f"<tr><td>{_esc(r.date)}</td>{_stk_cell(r.code, r.name)}<td>{_esc(r.trade_type)}</td>"
                 f"<td>{r.price:,.2f}</td><td>{prem}</td><td>{ir}</td>"
                 f"<td>{ev_glyph.get(r.dir_score, '–')} {r.dir_score:+.1f}</td>"
                 f"<td>{r.shares / 1000:,.0f}</td><td>{_fmt_m(r.value)}</td></tr>")
@@ -477,6 +601,17 @@ def write_report(ev, trades, latest, args, evs=None, windows=(), primary=""):
  tr.hl2 td{{background:#3a1d24}}
  tr.hl3 td{{background:#3a2d14}}
  .tbl{{overflow-x:auto}}
+ a{{color:#7dd3fc;text-decoration:none}} a:hover{{text-decoration:underline}}
+ .qbad{{color:#f87171}} .qsub{{color:#64748b;font-size:.92em}}
+ /* 凍結前兩欄（判定 / 標的），水平捲動時固定 */
+ .frz th:nth-child(1),.frz td:nth-child(1){{position:sticky;left:0;z-index:2;width:104px;min-width:104px}}
+ .frz th:nth-child(2),.frz td:nth-child(2){{position:sticky;left:104px;z-index:2;min-width:148px}}
+ .frz th:nth-child(-n+2){{z-index:3}}
+ .frz th:nth-child(1),.frz td:nth-child(1),
+ .frz th:nth-child(2),.frz td:nth-child(2){{background:#1e293b}}
+ .frz tr.hl td:nth-child(-n+2){{background:#14321f}}
+ .frz tr.hl2 td:nth-child(-n+2){{background:#3a1d24}}
+ .frz tr.hl3 td:nth-child(-n+2){{background:#3a2d14}}
  footer{{color:#64748b;font-size:.78rem;margin-top:16px;line-height:1.6}}
 </style></head><body><div class="wrap">
 <h1>🧲 鉅額成交方向判定 × 權證同向訊號</h1>
@@ -489,7 +624,7 @@ def write_report(ev, trades, latest, args, evs=None, windows=(), primary=""):
  <p class="gsub">鉅額成交判定為<b>買進/吸籌</b>（溢價成交或同日法人大額買超），且認購權證
  「價漲金額 &gt; 價跌金額」連買 ≥ {args.streak_min} 日、當日認購額 ≥ {args.vol_mult:.1f}× 前 {args.vol_lookback} 日中位數
  ——現貨與槓桿資金<b>同向</b>操作，跟進買入。分數 = 連買 × min(量能,5) × (1+鉅額方向)。</p>
- <div class="tbl"><table>
+ <div class="tbl frz"><table>
   {_THEAD}
   {rows_of(buy_tbl)}
  </table></div>
@@ -500,7 +635,7 @@ def write_report(ev, trades, latest, args, evs=None, windows=(), primary=""):
  <p class="gsub">現貨被<b>折價鉅額出脫</b>（或同日法人大額賣超），權證卻有買盤——
  典型「<b>賣現貨、買權證</b>」：大戶出脫現貨後以權證留倉/避險，權證買盤非新多頭資金。
  此形態一律剔除不買（本表留存供人工覆核與日後驗證）。</p>
- <div class="tbl"><table>
+ <div class="tbl frz"><table>
   {_THEAD}
   {rows_of(hedge_tbl)}
  </table></div>
@@ -512,7 +647,7 @@ def write_report(ev, trades, latest, args, evs=None, windows=(), primary=""):
  🚫 避險換倉 = 鉅額賣×權證買盤（剔除）· 🔴 出貨避開 = 鉅額賣×權證無買盤 ·
  ⚪ 不明 = 視窗內認購成交 &lt; {args.min_call_value / 1e6:.0f}M 或證據矛盾。
  「鉅額方向」括號內為金額加權方向分數（-1~+1）；「法人比」= 同日三大法人買賣超金額 ÷ 鉅額金額。</p>
- <div class="tbl"><table>
+ <div class="tbl frz"><table>
   {_THEAD}
   {rows_of(all_tbl)}
  </table></div>
@@ -540,8 +675,17 @@ def write_report(ev, trades, latest, args, evs=None, windows=(), primary=""):
             f.write(html)
     print(f"📝 報表 → {HTML_FILE}（index.html 同步）")
 
+    def _sorted_all(e):
+        et = e.copy()
+        et["verdict"] = pd.Categorical(
+            et["verdict"],
+            categories=["same_dir_buy", "lean_buy", "hedge_suspect", "sell_avoid", "unclear"])
+        return et.sort_values(["verdict", "blk_value"], ascending=[True, False])
+
     payload = {
+        "schema": SIGNALS_SCHEMA,
         "date": latest,
+        "primary_window": primary,
         "params": {"streak_min": args.streak_min, "vol_mult": args.vol_mult,
                    "vol_lookback": args.vol_lookback,
                    "windows": list(windows), "primary_window": primary,
@@ -554,6 +698,7 @@ def write_report(ev, trades, latest, args, evs=None, windows=(), primary=""):
             "buy_signals": e[e["verdict"] == "same_dir_buy"]
             .sort_values("score", ascending=False).to_dict("records"),
             "excluded_hedge": e[e["verdict"] == "hedge_suspect"].to_dict("records"),
+            "block_directions": _sorted_all(e).to_dict("records"),   # 每窗完整判定表
         } for w, e in (evs or {}).items()},
     }
     with open(SIGNALS_JSON, "w", encoding="utf-8") as f:
@@ -562,6 +707,7 @@ def write_report(ev, trades, latest, args, evs=None, windows=(), primary=""):
 
 
 def main():
+    _enable_utf8_console()   # Windows cp950 主控台 print emoji 不炸
     ap = argparse.ArgumentParser(description="鉅額成交方向判定 × 權證同向訊號：每日更新")
     ap.add_argument("--backfill", type=int, default=0, help="首次回補的日曆日數")
     ap.add_argument("--no-update", action="store_true", help="跳過抓取，只用既有 CSV 出報表")
@@ -664,8 +810,12 @@ def main():
         if len(ws) >= 2:
             print(f"   ⏱ {code} {name} 同向買入共振 {len(ws)} 窗：{'、'.join(_win_label(w) for w in ws)}")
 
-    n_hist = append_signal_history(all_ev, latest)
-    print(f"📚 判定歷史 +{n_hist} 筆（{len(evs)} 窗）→ {SIGNAL_HISTORY_BASE}/")
+    n_today, n_over = append_signal_history(all_ev, latest)
+    if n_over:
+        print(f"📚 判定歷史：本日 {n_today} 筆（{len(evs)} 窗，同日覆蓋既有 {n_over} 筆，淨增 0）"
+              f"→ {SIGNAL_HISTORY_BASE}/")
+    else:
+        print(f"📚 判定歷史：本日新增 {n_today} 筆（{len(evs)} 窗）→ {SIGNAL_HISTORY_BASE}/")
     write_report(ev, trades, latest, args, evs=evs, windows=windows, primary=primary)
 
 

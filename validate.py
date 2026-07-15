@@ -27,7 +27,7 @@ sys.path.insert(0, _HERE)
 
 from block_trades import load_block_history                       # noqa: E402
 from market_refs import load_close_history, load_inst_history     # noqa: E402
-from update import classify_block_direction                       # noqa: E402
+from update import classify_block_direction, _enable_utf8_console  # noqa: E402
 
 MARKET = "0050"          # 市場基準（超額報酬用）
 HORIZONS = (5, 10, 20)   # 交易日
@@ -81,6 +81,7 @@ def summarize(df, by, title):
 
 
 def main():
+    _enable_utf8_console()
     ap = argparse.ArgumentParser(description="鉅額方向判定的事後驗證")
     ap.add_argument("--prem-th", type=float, default=0.005)
     ap.add_argument("--inst-ratio", type=float, default=0.5)

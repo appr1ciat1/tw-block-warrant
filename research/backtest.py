@@ -20,7 +20,10 @@ backtest.py — 鉅額×權證訊號的事件驅動回測引擎（地基）
     python backtest.py --verdicts same_dir_buy,lean_buy --cost-bps 40
 """
 import argparse
+import bisect
+import hashlib
 import os
+import pickle
 import sys
 
 import numpy as np
@@ -34,9 +37,10 @@ from block_trades import load_block_history
 from warrant_flows import load_warrant_history
 from market_refs import load_close_history, load_inst_history
 from update import (classify_block_direction, build_evidence, classify,
-                    window_cutoff, STOCK_CODE)
+                    window_cutoff, STOCK_CODE, _enable_utf8_console)
 
 REPORT = os.path.join(_HERE, "backtest.html")   # 延伸版輸出留在 research/
+CACHE_DIR = os.path.join(_HERE, "artifacts")    # 訊號回放快取（research/artifacts/）
 MKT = "0050"
 TRADING_DAYS = 252
 
@@ -51,12 +55,36 @@ class SArgs:
     inst_ratio = 0.5
 
 
-def compute_signals(block, warr, closes, inst, windows, primary, sargs, warmup=25):
+def _signals_key(block, warr, closes, inst, windows, primary, sargs, warmup):
+    """訊號快取指紋：資料範圍(len+min+max)+**內容雜湊**+窗+參數。
+    內容雜湊讓「同筆數同日期範圍但值被在地更正(補洞/重抓覆寫)」也能失效重算。"""
+    parts = []
+    for df in (block, warr, closes, inst):
+        lo = df["date"].min() if len(df) else "-"
+        hi = df["date"].max() if len(df) else "-"
+        h = int(pd.util.hash_pandas_object(df, index=False).sum()) if len(df) else 0
+        parts.append(f"{len(df)}:{lo}:{hi}:{h}")
+    parts += [",".join(map(str, windows)), str(primary), str(warmup),
+              f"{sargs.streak_min},{sargs.vol_mult},{sargs.vol_lookback},"
+              f"{sargs.min_call_value},{sargs.prem_th},{sargs.inst_ratio}"]
+    return hashlib.md5("|".join(parts).encode()).hexdigest()[:16]
+
+
+def compute_signals(block, warr, closes, inst, windows, primary, sargs, warmup=25, cache=True):
     """
     日級回放，回傳每個 as-of 日的訊號：
         {date: {code: {"verdict":..., "reso":共振窗數, "score":...}}}
-    reso = 該檔被幾個窗判為 same_dir_buy。
+    reso = 該檔被幾個窗判為 same_dir_buy。cache=True 時以資料指紋快取到 research/artifacts/。
     """
+    if cache:
+        cpath = os.path.join(
+            CACHE_DIR,
+            f"signals_{_signals_key(block, warr, closes, inst, windows, primary, sargs, warmup)}.pkl")
+        if os.path.exists(cpath):
+            print(f"  ✓ 訊號快取命中 {os.path.basename(cpath)}")
+            with open(cpath, "rb") as f:
+                return pickle.load(f)
+
     wd = sorted(warr[warr["underlying"].astype(str).str.match(STOCK_CODE)]["date"].unique())
     asof_list = wd[warmup:]
     out = {}
@@ -65,7 +93,7 @@ def compute_signals(block, warr, closes, inst, windows, primary, sargs, warmup=2
         w_s = warr[warr["date"] <= asof]
         c_s = closes[closes["date"] <= asof]
         i_s = inst[inst["date"] <= asof]
-        wd_s = [d for d in wd if d <= asof]
+        wd_s = wd[:bisect.bisect_right(wd, asof)]   # wd 是純字串 list，bisect 安全
 
         per_win, reso = {}, {}
         for win in windows:
@@ -88,6 +116,10 @@ def compute_signals(block, warr, closes, inst, windows, primary, sargs, warmup=2
         out[asof] = day
         if (k + 1) % 50 == 0:
             print(f"  訊號回放 {k + 1}/{len(asof_list)}", flush=True)
+    if cache:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(cpath, "wb") as f:
+            pickle.dump(out, f)
     return out
 
 
@@ -124,52 +156,54 @@ def run_backtest(signals, closes, hold=10, verdicts=("same_dir_buy",), min_reso=
     # 每個進場日 → {code: conviction}
     entries = {d: select(s, set(verdicts), min_reso) for d, s in signals.items()}
 
-    # 逐日建構持有組合：held[t] = 前 hold 個交易日內進場、仍在持有期的標的
+    # 逐日建構持有組合。active: code -> (first_earn_idx, last_earn_idx, conviction)。
+    # 訊號用第 t-1 日資料 → 第 t 日收盤買入 → 次日 t+1 起計酬、持有到 t+hold 收盤賣出。
+    # 進場當日 t 不吃 ret.iloc[t]（那是「買入前」close(t-1)→close(t) 的報酬）——消除
+    # 一日前視，使權益曲線與逐筆 close(t)→close(t+hold) 口徑一致。
     date_idx = {d: k for k, d in enumerate(dates)}
-    active = {}   # code -> (exit_index, conviction)
+    active = {}
     strat_r, mkt_r, npos_series, prev_w = [], [], [], {}
     trades = []
     cost = cost_bps / 1e4
+    ret_np = {c: ret[c].to_numpy() for c in px.columns}   # 逐格 iloc 太慢，先轉 numpy
+    mkt_np = ret[MKT].to_numpy() if MKT in px.columns else np.zeros(len(dates))
 
     for t, d in enumerate(dates):
-        # 出場：到期移除
-        active = {c: (xi, cv) for c, (xi, cv) in active.items() if xi > t}
-        # 進場：昨日(d-1)訊號 → 今日(d)收盤買入，持有 hold 日 → 出場 index t+hold
+        active = {c: v for c, v in active.items() if v[1] >= t}   # last_earn < t → 出場
         if t > 0:
-            prev_d = dates[t - 1]
-            for code, cv in entries.get(prev_d, {}).items():
+            for code, cv in entries.get(dates[t - 1], {}).items():
                 if code in px.columns:
-                    active[code] = (t + hold, cv)
+                    # 重複觸發：保留原 first_earn（避免計酬缺口），只延長出場到 t+hold
+                    fe = active[code][0] if code in active else t + 1
+                    active[code] = (fe, t + hold, cv)
                     trades.append({"entry": d, "code": code, "conviction": cv,
                                    "exit_idx": t + hold})
-        # 權重
-        codes = [c for c in active if c in px.columns]
-        if max_pos and len(codes) > max_pos:   # 保留共振/分數最高
-            codes = sorted(codes, key=lambda c: -active[c][1])[:max_pos]
-        if codes:
+        # 當日計酬集合：first_earn <= t <= last_earn（進場當日尚未計酬）
+        earn = [c for c, v in active.items() if v[0] <= t <= v[1]]
+        if max_pos and len(earn) > max_pos:
+            earn = sorted(earn, key=lambda c: -active[c][2])[:max_pos]
+        if earn:
             if weight == "conviction":
-                cv = np.array([active[c][1] for c in codes], float)
+                cv = np.array([active[c][2] for c in earn], float)
                 w = cv / cv.sum()
             else:
-                w = np.full(len(codes), 1.0 / len(codes))
-            wmap = dict(zip(codes, w))
+                w = np.full(len(earn), 1.0 / len(earn))
+            wmap = dict(zip(earn, w))
         else:
             wmap = {}
 
-        # 當日組合報酬（持有部位吃當日報酬）
-        if wmap and t > 0:
-            day_r = sum(wmap[c] * (ret[c].iloc[t] if pd.notna(ret[c].iloc[t]) else 0.0)
-                        for c in wmap)
-        else:
-            day_r = 0.0
-        # 週轉成本（權重變化）
-        turn = sum(abs(wmap.get(c, 0) - prev_w.get(c, 0))
-                   for c in set(wmap) | set(prev_w))
+        day_r = 0.0
+        for c, wt in wmap.items():
+            rc = ret_np[c][t]
+            if not np.isnan(rc):
+                day_r += wt * rc
+        turn = sum(abs(wmap.get(c, 0) - prev_w.get(c, 0)) for c in set(wmap) | set(prev_w))
         day_r -= turn * cost
         prev_w = wmap
 
         strat_r.append(day_r)
-        mkt_r.append(ret[MKT].iloc[t] if (MKT in px.columns and pd.notna(ret[MKT].iloc[t])) else 0.0)
+        m = mkt_np[t]
+        mkt_r.append(m if not np.isnan(m) else 0.0)
         npos_series.append(len(wmap))
 
     eq = pd.DataFrame({"date": dates, "strat_r": strat_r, "mkt_r": mkt_r, "n_pos": npos_series})
@@ -280,6 +314,7 @@ def write_report(eq, metrics, cfg):
 
 
 def main():
+    _enable_utf8_console()
     ap = argparse.ArgumentParser(description="鉅額×權證訊號事件驅動回測")
     ap.add_argument("--verdicts", default="same_dir_buy", help="進場判定(逗號分隔)")
     ap.add_argument("--min-reso", type=int, default=0, help="最低共振窗數")

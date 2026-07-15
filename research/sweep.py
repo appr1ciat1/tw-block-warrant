@@ -24,10 +24,11 @@ sys.path.insert(0, _HERE)   # 同層的 backtest
 from block_trades import load_block_history
 from warrant_flows import load_warrant_history
 from market_refs import load_close_history, load_inst_history
-from backtest import compute_signals, run_backtest, SArgs
+from backtest import compute_signals, run_backtest, SArgs, _enable_utf8_console
 
 
 def main():
+    _enable_utf8_console()
     ap = argparse.ArgumentParser(description="回測設定掃描")
     ap.add_argument("--windows", default="5,10,15,20,W3")
     ap.add_argument("--primary", default="10")

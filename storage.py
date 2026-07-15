@@ -26,6 +26,24 @@ def _read(path, columns):
     return df[columns]
 
 
+def _atomic_write_csv(df, path):
+    """
+    Atomic 寫檔：先寫暫存檔、fsync、再 os.replace 換上。
+    避免 to_csv 直接覆寫時目標檔短暫變 0-byte/半檔（外部讀者會讀到空檔）。
+    os.replace 在同檔案系統上是 atomic：讀者永遠看到舊完整檔或新完整檔。
+    """
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        df.to_csv(tmp, index=False)
+        os.replace(tmp, path)   # 同檔案系統上 atomic：讀者只看到舊或新完整檔
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def load_history(base, columns, years=None):
     """
     讀歷史。base 不含副檔名（如 data/stock_closes）：
@@ -66,15 +84,20 @@ def save_history(base, df, keep_years=None, sort_cols=("date",)):
     if keep_years:
         cutoff_year = pd.Timestamp.today().year - int(keep_years) + 1
         df = df[df["date"].str[:4].astype(int) >= cutoff_year]
+
+    # 先 atomic 寫入所有留存年檔（讀者永遠看到完整檔），成功後才刪過舊檔——
+    # 縮短不一致窗口：中途中斷最多留下多餘的舊年檔，不會遺失當前資料。
+    for year, g in df.groupby(df["date"].str[:4]):
+        _atomic_write_csv(g, os.path.join(base, f"{year}.csv"))
+
+    if keep_years:
+        cutoff_year = pd.Timestamp.today().year - int(keep_years) + 1
         for f in glob.glob(os.path.join(base, "*.csv")):
             try:
                 if int(os.path.splitext(os.path.basename(f))[0]) < cutoff_year:
                     os.remove(f)
             except ValueError:
                 continue
-
-    for year, g in df.groupby(df["date"].str[:4]):
-        g.to_csv(os.path.join(base, f"{year}.csv"), index=False)
 
     legacy = base + ".csv"
     if os.path.exists(legacy):

@@ -28,7 +28,7 @@ sys.path.insert(0, _HERE)
 from block_trades import load_block_history
 from warrant_flows import load_warrant_history
 from market_refs import load_close_history, load_inst_history
-from backtest import compute_signals, run_backtest, SArgs
+from backtest import compute_signals, run_backtest, SArgs, _enable_utf8_console
 
 TRADING_DAYS = 252
 
@@ -67,6 +67,7 @@ def capm(strat_r, mkt_r):
 
 
 def main():
+    _enable_utf8_console()
     ap = argparse.ArgumentParser(description="訊號 alpha 分析（市場中性/多空）")
     ap.add_argument("--hold", type=int, default=10)
     ap.add_argument("--min-reso", type=int, default=3)
