@@ -21,6 +21,10 @@ on:
         description: '深挖每請求間隔秒數（越大越不易觸發 TWSE 封鎖，但越慢；預設 6）'
         required: false
         default: '6'
+      scheduled:
+        description: '外部定時服務準時觸發用：true＝套用與排程相同的交易日判定，且當天已處理過就跳過'
+        required: false
+        default: 'false'
 
 concurrency:
   group: daily-update
@@ -35,6 +39,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # 取「開始執行當下」的分支最新版：外部準時觸發與 GitHub 備援排程可能排隊先後執行，
+          # 後一次必須看到前一次 commit 的 signals.json，冪等跳過才會生效。
+          ref: ${{ github.ref }}
           fetch-depth: 1
           fetch-tags: false
 
@@ -46,24 +53,59 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # 準時觸發：GitHub 排程常延遲數小時，改由外部定時服務在台灣 19:00 呼叫 workflow_dispatch
+      # （inputs.scheduled=true）。GitHub 排程保留為備援；當天已處理過的話，後到的那一次會自動跳過。
       - name: Check Taiwan trading day
         id: twcheck
+        env:
+          SCHEDULED_INPUT: ${{ github.event.inputs.scheduled }}
         run: |
           python - <<'PY'
-          import os, datetime
+          import os, json, datetime
           is_trading = True
-          if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+          missed = []
+          tw = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date()
+          scheduled_like = (os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+                            or os.environ.get("SCHEDULED_INPUT") == "true")
+          if scheduled_like:
               try:
                   import exchange_calendars as xcals, pandas as pd
-                  tw = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date()
-                  is_trading = bool(xcals.get_calendar("XTAI").is_session(pd.Timestamp(tw)))
-                  print("台灣日期", tw, "交易日?", is_trading)
+                  cal = xcals.get_calendar("XTAI")
+                  # 以台灣時間往回推 12 小時判定「本次所屬交易日」（台灣 12:00～隔日 11:59 → 同一天）。
+                  # GitHub 排程常延遲數小時；舊寫法用「開始執行的台灣日期」，一旦拖過午夜就判成隔天，
+                  # 隔天若休市就整天跳過（2026-10-08 排程拖到 10/09 01:41，被判成補假而漏跑）。
+                  tw = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+                        - datetime.timedelta(hours=12)).date()
+                  is_trading = bool(cal.is_session(pd.Timestamp(tw)))
+                  print("本次所屬日（台灣）", tw, "交易日?", is_trading)
+                  # 漏跑偵測：signals.json 的 date = 最近一次完成判定的交易日
+                  last = json.load(open("signals.json", encoding="utf-8")).get("date")
+                  if last:
+                      start = pd.Timestamp(last) + pd.Timedelta(days=1)
+                      end = pd.Timestamp(tw) - pd.Timedelta(days=1)
+                      if end >= start:
+                          missed = [d.strftime("%Y-%m-%d") for d in cal.sessions_in_range(start, end)]
+                      print("最近完成判定日", last, "→ 未處理的交易日", missed or "無")
+                  else:
+                      print("::warning::signals.json 沒有 date，無法做漏跑偵測")
+                  # 冪等：外部準時觸發與 GitHub 備援排程都會跑，同一交易日只處理一次
+                  if is_trading and last and last >= tw.isoformat():
+                      is_trading = False
+                      print(f"{tw} 已處理過（signals.json date={last}），本次為重複觸發 → 跳過")
+                  if missed and is_trading:
+                      # 原始資料會由增量抓取自動補回，但被跳過那天的「判定歷史」不會產生
+                      print(f"::warning::漏跑交易日 {', '.join(missed)}：原始資料本次會自動補抓，"
+                            f"但當天的訊號判定紀錄不會補產")
               except Exception as e:
                   print("行事曆判定失敗，預設執行:", e); is_trading = True
+                  print(f"::warning::XTAI 行事曆判定失敗，預設執行: {e}")
           else:
-              print("手動觸發 → 一律執行")
+              print("手動觸發（scheduled=false）→ 一律執行")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"is_trading={'true' if is_trading else 'false'}\n")
+              f.write(f"ref_date={tw.isoformat()}\n")
+              # 只在「本次跳過」時用來讓 run 變紅並寄信
+              f.write(f"missed_on_skip={','.join(missed) if (missed and not is_trading) else ''}\n")
           PY
 
       - name: Update data + signals + report
@@ -88,9 +130,22 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes"
           else
-            git commit -m "🧲 daily update ($(date -u -d '+8 hours' '+%Y-%m-%d') TW)"
+            git commit -m "🧲 daily update (${{ steps.twcheck.outputs.ref_date }} TW)"
           fi
 
           git fetch --no-tags --depth=50 origin main:refs/remotes/origin/main
           git rebase --autostash origin/main
           git push origin HEAD:main
+
+      # 漏跑警報：本次判定為非交易日而跳過，但最近的交易日還沒處理 → 讓 run 變紅，GitHub 會寄信。
+      - name: Missed-run alarm
+        if: always() && steps.twcheck.outputs.missed_on_skip != ''
+        run: |
+          D="${{ steps.twcheck.outputs.missed_on_skip }}"
+          echo "::error::本次排程判定為非交易日而跳過，但交易日 ${D} 尚未處理（GitHub 排程延遲或漏跑）"
+          cat >> "$GITHUB_STEP_SUMMARY" <<MD
+          ## ❌ 漏跑交易日：${D}
+          GitHub 排程延遲或漏跑，該交易日沒有更新。處置：Actions → **Daily Update** → Run workflow
+          （原始資料會自動補抓到最新；被跳過那天的訊號判定紀錄不會補產）。
+          MD
+          exit 1
