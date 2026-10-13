@@ -21,6 +21,10 @@ on:
         description: '深挖每請求間隔秒數（越大越不易觸發 TWSE 封鎖，但越慢；預設 6）'
         required: false
         default: '6'
+      scheduled:
+        description: '外部定時服務準時觸發用：true＝套用與排程相同的交易日判定，且當天已處理過就跳過'
+        required: false
+        default: 'false'
 
 concurrency:
   group: daily-update
@@ -46,15 +50,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # 準時觸發：GitHub 排程常延遲數小時，改由外部定時服務在台灣 19:00 呼叫 workflow_dispatch
+      # （inputs.scheduled=true）。GitHub 排程保留為備援；當天已處理過的話，後到的那一次會自動跳過。
       - name: Check Taiwan trading day
         id: twcheck
+        env:
+          SCHEDULED_INPUT: ${{ github.event.inputs.scheduled }}
         run: |
           python - <<'PY'
           import os, json, datetime
           is_trading = True
           missed = []
           tw = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date()
-          if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+          scheduled_like = (os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+                            or os.environ.get("SCHEDULED_INPUT") == "true")
+          if scheduled_like:
               try:
                   import exchange_calendars as xcals, pandas as pd
                   cal = xcals.get_calendar("XTAI")
@@ -75,6 +85,10 @@ jobs:
                       print("最近完成判定日", last, "→ 未處理的交易日", missed or "無")
                   else:
                       print("::warning::signals.json 沒有 date，無法做漏跑偵測")
+                  # 冪等：外部準時觸發與 GitHub 備援排程都會跑，同一交易日只處理一次
+                  if is_trading and last and last >= tw.isoformat():
+                      is_trading = False
+                      print(f"{tw} 已處理過（signals.json date={last}），本次為重複觸發 → 跳過")
                   if missed and is_trading:
                       # 原始資料會由增量抓取自動補回，但被跳過那天的「判定歷史」不會產生
                       print(f"::warning::漏跑交易日 {', '.join(missed)}：原始資料本次會自動補抓，"
@@ -83,7 +97,7 @@ jobs:
                   print("行事曆判定失敗，預設執行:", e); is_trading = True
                   print(f"::warning::XTAI 行事曆判定失敗，預設執行: {e}")
           else:
-              print("手動觸發 → 一律執行")
+              print("手動觸發（scheduled=false）→ 一律執行")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"is_trading={'true' if is_trading else 'false'}\n")
               f.write(f"ref_date={tw.isoformat()}\n")
