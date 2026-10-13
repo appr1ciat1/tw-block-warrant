@@ -39,6 +39,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # 取「開始執行當下」的分支最新版：外部準時觸發與 GitHub 備援排程可能排隊先後執行，
+          # 後一次必須看到前一次 commit 的 signals.json，冪等跳過才會生效。
+          ref: ${{ github.ref }}
           fetch-depth: 1
           fetch-tags: false
 
